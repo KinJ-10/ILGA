@@ -18,6 +18,7 @@ import asyncio
 import struct
 import threading
 import time
+import sys
 from dataclasses import dataclass
 from queue import Queue, Empty
 from typing import Optional, Tuple, List
@@ -39,6 +40,7 @@ SCAN_TIMEOUT_SEC = 10.0
 CONNECT_TIMEOUT_SEC = 20.0
 CONNECT_RETRIES = 3
 RETRY_DELAY_SEC = 1.0
+CONNECT_POST_DELAY_SEC = 0.5  # WinRT backend can be flaky right after connect; small delay helps.
 
 WINDOW_SEC = 3.0
 
@@ -51,6 +53,13 @@ G0 = 9.80665
 #  - 'mg'         : ax/ay/az are milli-g (1g ≈ 1000)
 #  - 'mps2_milli'  : ax/ay/az are milli-(m/s^2) (1g ≈ 9806.65)
 ACC_PAYLOAD_MODE = 'mps2_milli'
+
+# Windows (Bleak WinRT) stability knobs:
+# - use_cached_services: False avoids stale GATT cache causing "Could not get GATT services: Unreachable"
+# - address_type: set to "public" or "random" if your device uses privacy/random addressing.
+#   Leave None unless you need it, then try "public" -> "random".
+WINRT_USE_CACHED_SERVICES = False
+WINRT_ADDRESS_TYPE: Optional[str] = None  # "public" or "random" or None
 
 
 def bleak_version() -> str:
@@ -195,10 +204,20 @@ async def ble_worker(sample_q: Queue, stop_evt: threading.Event) -> None:
 
     print(f"[BLE] Found: name='{device.name}' address='{device.address}'")
 
-    client = BleakClient(device, timeout=CONNECT_TIMEOUT_SEC)
+    # WinRT options are only relevant on Windows; other backends will ignore/should not receive them.
+    client_kwargs = {}
+    if sys.platform.startswith("win"):
+        winrt_opts = {"use_cached_services": WINRT_USE_CACHED_SERVICES}
+        if WINRT_ADDRESS_TYPE:
+            winrt_opts["address_type"] = WINRT_ADDRESS_TYPE
+        client_kwargs["winrt"] = winrt_opts
+
+    client = BleakClient(device, timeout=CONNECT_TIMEOUT_SEC, **client_kwargs)
 
     try:
         await _connect_with_retry(client)
+        if CONNECT_POST_DELAY_SEC > 0:
+            await asyncio.sleep(CONNECT_POST_DELAY_SEC)
 
         # Services discovery retry once
         for s_try in (1, 2):
@@ -215,6 +234,8 @@ async def ble_worker(sample_q: Queue, stop_evt: threading.Event) -> None:
                     pass
                 await asyncio.sleep(RETRY_DELAY_SEC)
                 await _connect_with_retry(client)
+                if CONNECT_POST_DELAY_SEC > 0:
+                    await asyncio.sleep(CONNECT_POST_DELAY_SEC)
 
         all_chars = []
         for s in svcs:
