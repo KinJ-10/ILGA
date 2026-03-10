@@ -50,13 +50,6 @@
  * BMI270 helper (from マージ用_BMI.txt)
  * ==========================================================*/
 
-/* sensor_value → milli-unit integer (mg or mdps) */
-static inline int32_t sv_to_milli(const struct sensor_value *v)
-{
-	/* val2 is in 1e-6 units */
-	return (int32_t)(v->val1 * 1000 + v->val2 / 1000);
-}
-
 /* ============================================================
  * BLE base (from マージ用_BLE.txt)
  * ==========================================================*/
@@ -709,13 +702,13 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_XYZ, acc);
 		sensor_channel_get(bmi, SENSOR_CHAN_GYRO_XYZ, gyr);
 
-		int32_t ax_mg32 = sv_to_milli(&acc[0]);
-		int32_t ay_mg32 = sv_to_milli(&acc[1]);
-		int32_t az_mg32 = sv_to_milli(&acc[2]);
+		int32_t ax_mg32 = sensor_ms2_to_mg(&acc[0]);
+		int32_t ay_mg32 = sensor_ms2_to_mg(&acc[1]);
+		int32_t az_mg32 = sensor_ms2_to_mg(&acc[2]);
 
-		int32_t gx_mdps = sv_to_milli(&gyr[0]);
-		int32_t gy_mdps = sv_to_milli(&gyr[1]);
-		int32_t gz_mdps = sv_to_milli(&gyr[2]);
+		int32_t gx_mdps = sensor_rad_to_10udegrees(&gyr[0]) / 100;
+		int32_t gy_mdps = sensor_rad_to_10udegrees(&gyr[1]) / 100;
+		int32_t gz_mdps = sensor_rad_to_10udegrees(&gyr[2]) / 100;
 
 		/* clamp accel to int16 range */
 		if (ax_mg32 > INT16_MAX)
@@ -739,7 +732,7 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 		pack_and_store_acc(seq, ax_mg, ay_mg, az_mg);
 		pack_and_store_gyr(seq, gx_mdps, gy_mdps, gz_mdps);
 
-		/* UART CSV line (same format as your Python viewer expects) */
+		/* UART CSV line: seq, accel mg, gyro mdps */
 		printk("%u,%d,%d,%d,%d,%d,%d\n",
 			   seq,
 			   (int)ax_mg, (int)ay_mg, (int)az_mg,
