@@ -132,6 +132,41 @@ seq,ax,ay,az,gx,gy,gz
 - 角速度は `sensor_rad_to_10udegrees() / 100` で `mdps` に変換
 - 以前は `milli-m/s^2` と `milli-rad/s` 相当だったが、現在は `mg / mdps` に統一済み
 
+## BLE notify の現状
+
+- BMI270 の値は UART CSV だけでなく、BLE notify 経路にも格納される実装になっている
+- Accel notify payload:
+  - `seq(u32 LE) + ax(i16 LE) + ay(i16 LE) + az(i16 LE)`
+  - 合計 `10 bytes`
+- Gyro notify payload:
+  - `seq(u32 LE) + gx(i32 LE) + gy(i32 LE) + gz(i32 LE)`
+  - 合計 `16 bytes`
+- 単位は UART と同じ
+  - accel = `mg`
+  - gyro = `mdps`
+
+起動ログ上の UUID:
+
+- device name: `BMI270_BLE_SAMPLE`
+- ACC characteristic UUID: `12345678-1234-5678-1234-6789abcdef11`
+- GYR characteristic UUID: `12345678-1234-5678-1234-6789abcdef12`
+
+評価手順:
+
+1. 中央機器から `BMI270_BLE_SAMPLE` に接続
+2. ACC / GYR characteristic の notify を有効化
+3. UART 側で以下を確認
+   - `BMI ACC notify ENABLED`
+   - `BMI GYR notify ENABLED`
+   - 成功時: `BMI ACC notify active (10 bytes)`, `BMI GYR notify active (16 bytes)`
+   - 失敗時: `BMI ACC notify err=...`, `BMI GYR notify err=...`
+
+補足:
+
+- このリポジトリの実装では、中央機器未接続または未 subscribe 状態では notify は送られない
+- これまでの作業ではコード経路と payload 整合までは確認済み
+- 実際の over-the-air notify 受信は、中央機器での subscribe 実施が次の確認項目
+
 ## 未解決事項 / 今後の確認項目
 
 - 長時間連続動作時の安定性は未確認

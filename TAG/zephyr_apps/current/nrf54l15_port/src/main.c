@@ -91,6 +91,8 @@ static uint8_t bmi_gyr_last[16]; /* seq u32 + 3x i32 = 16 bytes */
 /* notification enable flags */
 static bool bmi_acc_notify_enabled;
 static bool bmi_gyr_notify_enabled;
+static int bmi_acc_notify_last_ret = INT32_MIN;
+static int bmi_gyr_notify_last_ret = INT32_MIN;
 
 /* attribute pointers (set at runtime with bt_gatt_find_by_uuid) */
 static const struct bt_gatt_attr *bmi_acc_attr;
@@ -145,6 +147,7 @@ static void bmi_acc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t va
 {
 	ARG_UNUSED(attr);
 	bmi_acc_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+	bmi_acc_notify_last_ret = INT32_MIN;
 	printk("BMI ACC notify %s\n", bmi_acc_notify_enabled ? "ENABLED" : "DISABLED");
 }
 
@@ -152,6 +155,7 @@ static void bmi_gyr_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t va
 {
 	ARG_UNUSED(attr);
 	bmi_gyr_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+	bmi_gyr_notify_last_ret = INT32_MIN;
 	printk("BMI GYR notify %s\n", bmi_gyr_notify_enabled ? "ENABLED" : "DISABLED");
 }
 
@@ -447,6 +451,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
+
+	bmi_acc_notify_last_ret = INT32_MIN;
+	bmi_gyr_notify_last_ret = INT32_MIN;
 }
 
 static void alert_stop(void) { printk("Alert stopped\n"); }
@@ -743,13 +750,39 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 		{
 			if (bmi_acc_notify_enabled && bmi_acc_attr)
 			{
-				(void)bt_gatt_notify(current_conn, bmi_acc_attr,
-									 bmi_acc_last, sizeof(bmi_acc_last));
+				int notify_ret = bt_gatt_notify(current_conn, bmi_acc_attr,
+										 bmi_acc_last, sizeof(bmi_acc_last));
+				if (notify_ret != bmi_acc_notify_last_ret)
+				{
+					if (notify_ret == 0)
+					{
+						printk("BMI ACC notify active (%u bytes)\n",
+							   (unsigned int)sizeof(bmi_acc_last));
+					}
+					else
+					{
+						printk("BMI ACC notify err=%d\n", notify_ret);
+					}
+					bmi_acc_notify_last_ret = notify_ret;
+				}
 			}
 			if (bmi_gyr_notify_enabled && bmi_gyr_attr)
 			{
-				(void)bt_gatt_notify(current_conn, bmi_gyr_attr,
-									 bmi_gyr_last, sizeof(bmi_gyr_last));
+				int notify_ret = bt_gatt_notify(current_conn, bmi_gyr_attr,
+										 bmi_gyr_last, sizeof(bmi_gyr_last));
+				if (notify_ret != bmi_gyr_notify_last_ret)
+				{
+					if (notify_ret == 0)
+					{
+						printk("BMI GYR notify active (%u bytes)\n",
+							   (unsigned int)sizeof(bmi_gyr_last));
+					}
+					else
+					{
+						printk("BMI GYR notify err=%d\n", notify_ret);
+					}
+					bmi_gyr_notify_last_ret = notify_ret;
+				}
 			}
 		}
 
