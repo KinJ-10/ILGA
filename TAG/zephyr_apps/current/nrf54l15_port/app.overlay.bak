@@ -1,0 +1,23 @@
+/*
+ * Copyright (c) 2021 Bosch Sensortec GmbH
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+&arduino_i2c {
+	status = "okay";
+
+	bmi270@68 {
+		compatible = "bosch,bmi270";
+		reg = <0x68>;
+		label = "BMI270";
+		status = "okay";
+	};
+};
+
+/* i2c@9000（= i2c1）のバッファサイズ拡張 */
+&i2c1 {
+	status = "okay"; /* 元が disabled なので、ついでに有効化 */
+	zephyr,concat-buf-size = <260>;
+	zephyr,flash-buf-max-size = <260>;
+};
