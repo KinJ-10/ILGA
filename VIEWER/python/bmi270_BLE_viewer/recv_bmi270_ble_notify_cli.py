@@ -420,10 +420,34 @@ async def wait_for_stop(stop_event: asyncio.Event, duration_sec: Optional[float]
 
     stop_waiter = asyncio.create_task(stop_event.wait())
     duration_waiter = asyncio.create_task(asyncio.sleep(duration_sec))
-    done, pending = await asyncio.wait({stop_waiter, duration_waiter}, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    return duration_waiter in done
+    pending: set[asyncio.Task[object]] = set()
+    try:
+        done, pending = await asyncio.wait({stop_waiter, duration_waiter}, return_when=asyncio.FIRST_COMPLETED)
+        return duration_waiter in done
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def stop_notify_quietly(client, uuid: str) -> None:
+    try:
+        await client.stop_notify(uuid)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+async def disconnect_quietly(client) -> None:
+    try:
+        if client.is_connected:
+            await client.disconnect()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -448,6 +472,7 @@ async def run(args: argparse.Namespace) -> int:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     duration_reached = False
+    connected = False
 
     if sys.platform != "win32":
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -470,6 +495,7 @@ async def run(args: argparse.Namespace) -> int:
         async with BleakClient(device, disconnected_callback=on_disconnect) as client:
             if not client.is_connected:
                 raise BleakError("connect failed")
+            connected = True
 
             print("[BLE] connected")
             print(f"[BLE] subscribe ACC {ACC_UUID}")
@@ -486,19 +512,21 @@ async def run(args: argparse.Namespace) -> int:
                     print(f"[BLE] duration reached: {args.duration_sec:.3f}s", flush=True)
                     stop_event.set()
             except KeyboardInterrupt:
+                stop_event.set()
                 pass
             finally:
                 for uuid in (ACC_UUID, GYR_UUID):
-                    try:
-                        await client.stop_notify(uuid)
-                    except Exception:
-                        pass
+                    await stop_notify_quietly(client, uuid)
                 print("[BLE] notifications stopped")
                 if args.disconnect_on_finish and client.is_connected:
                     print("[BLE] disconnecting on finish", flush=True)
-                    await client.disconnect()
+                    await disconnect_quietly(client)
     except KeyboardInterrupt:
         pass
+    except asyncio.CancelledError:
+        if not (connected or stop_event.is_set() or duration_reached):
+            print("[BLE] error: operation cancelled before normal shutdown", file=sys.stderr)
+            return 1
     except Exception as exc:
         print(f"[BLE] error: {exc!r}", file=sys.stderr)
         return 1
@@ -515,7 +543,12 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
-    return asyncio.run(run(args))
+    try:
+        return asyncio.run(run(args))
+    except KeyboardInterrupt:
+        return 0
+    except asyncio.CancelledError:
+        return 0
 
 
 if __name__ == "__main__":

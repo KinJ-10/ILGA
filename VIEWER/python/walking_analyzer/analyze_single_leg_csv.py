@@ -235,7 +235,13 @@ def save_plot(
     plot_path: Path,
     fs: float,
     acc_dyn_mg: Sequence[float],
+    ax_mg: Sequence[float],
+    ay_mg: Sequence[float],
+    az_mg: Sequence[float],
     gyro_norm_mdps: Sequence[float],
+    gx_mdps: Sequence[float],
+    gy_mdps: Sequence[float],
+    gz_mdps: Sequence[float],
     peaks: Sequence[int],
     threshold: float,
 ) -> None:
@@ -248,20 +254,35 @@ def save_plot(
     peak_times = [idx / fs for idx in peaks]
     peak_values = [acc_dyn_mg[idx] for idx in peaks]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+
+    for axis in (ax1, ax2, ax3, ax4):
+        for peak_time in peak_times:
+            axis.axvline(peak_time, color="tab:red", alpha=0.12, linewidth=0.8)
+        axis.grid(True, alpha=0.3)
 
     ax1.plot(time_axis, acc_dyn_mg, label="acc_dyn_mg")
     ax1.axhline(threshold, color="tab:red", linestyle="--", label="threshold")
     ax1.scatter(peak_times, peak_values, color="tab:red", s=18, label="step peaks")
     ax1.set_ylabel("Dynamic Acc [mg]")
     ax1.legend(loc="upper right")
-    ax1.grid(True, alpha=0.3)
 
-    ax2.plot(time_axis, gyro_norm_mdps, label="gyro_norm_mdps", color="tab:green")
-    ax2.set_xlabel("Time [s]")
-    ax2.set_ylabel("Gyro Norm [mdps]")
+    ax2.plot(time_axis, ax_mg, label="ax_mg", linewidth=0.9)
+    ax2.plot(time_axis, ay_mg, label="ay_mg", linewidth=0.9)
+    ax2.plot(time_axis, az_mg, label="az_mg", linewidth=0.9)
+    ax2.set_ylabel("Acc Raw [mg]")
     ax2.legend(loc="upper right")
-    ax2.grid(True, alpha=0.3)
+
+    ax3.plot(time_axis, gyro_norm_mdps, label="gyro_norm_mdps", color="tab:green")
+    ax3.set_ylabel("Gyro Norm [mdps]")
+    ax3.legend(loc="upper right")
+
+    ax4.plot(time_axis, gx_mdps, label="gx_mdps", linewidth=0.9)
+    ax4.plot(time_axis, gy_mdps, label="gy_mdps", linewidth=0.9)
+    ax4.plot(time_axis, gz_mdps, label="gz_mdps", linewidth=0.9)
+    ax4.set_xlabel("Time [s]")
+    ax4.set_ylabel("Gyro Raw [mdps]")
+    ax4.legend(loc="upper right")
 
     fig.tight_layout()
     fig.savefig(plot_path, dpi=150)
@@ -365,7 +386,20 @@ def main() -> int:
     if args.plot:
         plot_path = Path(args.plot)
         plot_path.parent.mkdir(parents=True, exist_ok=True)
-        save_plot(plot_path, args.fs, acc_dyn_mg, gyro_norm_mdps, peaks, threshold)
+        save_plot(
+            plot_path,
+            args.fs,
+            acc_dyn_mg,
+            data["ax_mg"],
+            data["ay_mg"],
+            data["az_mg"],
+            gyro_norm_mdps,
+            data["gx_mdps"],
+            data["gy_mdps"],
+            data["gz_mdps"],
+            peaks,
+            threshold,
+        )
         print(f"[INFO] plot_saved={plot_path}")
 
     return 0
