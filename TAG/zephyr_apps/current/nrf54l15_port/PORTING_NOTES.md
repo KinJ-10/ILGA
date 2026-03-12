@@ -11,6 +11,8 @@
   - 起動ログ取得可能
   - BLE advertising まで確認済み
   - BMI270 初期化成功、UART CSV 出力まで確認済み
+  - BLE notify を VIEWER 側で CSV 保存可能
+  - BLE 切断後の再 advertising / 再接続成功を確認済み
 
 ## 実配線
 
@@ -68,6 +70,161 @@ TAG 側の BMI270 I2C 配線は以下を正とする。
 - ログは `logs/` に `tag_log_YYYYMMDD_HHMMSS.log` 形式で保存される
 - 画面にも出しつつ保存する
 - 必要なら `PORT=/dev/ttyACM0 ./scripts/tag_log_capture.sh 5` のように上書き可能
+
+## 運用方針
+
+- 実歩行ログ取得の主経路は BLE notify + CSV 保存とする
+- UART は補助用途とし、常時記録の主経路にはしない
+- UART の用途は以下に限定する
+  - 起動確認
+  - advertising / notify 状態確認
+  - 異常時切り分け
+
+## 実歩行ログ取得の正式手順
+
+BLE 主運用の実行場所を以下のように分ける。
+
+- Windows PowerShell:
+  - BLE central として TAG に接続
+  - notify を subscribe
+  - 実歩行 CSV を保存
+- WSL:
+  - build / flash
+  - UART 補助確認
+  - walking_analyzer 実行
+
+### 0. flash 前の前提
+
+- TAG は `nrf54l15dk/nrf54l15/cpuapp` 向け current ソースを使う
+- build / flash はリポジトリルートで WSL から実行する
+- BLE ログ保存先は WSL から参照できる場所に置く
+  - 推奨: リポジトリ配下の `logs/ble/`
+- Windows 側では `VIEWER/python/bmi270_BLE_viewer/requirements_ble_cli.txt` の依存を入れる
+
+WSL:
+
+```bash
+cd ~/work/ILGA
+./scripts/tag_build.sh
+./scripts/tag_flash.sh
+```
+
+Windows PowerShell:
+
+```powershell
+cd <ILGA working copy>\VIEWER\python\bmi270_BLE_viewer
+py -3 -m pip install -r .\requirements_ble_cli.txt
+```
+
+### 1. 起動と補助確認
+
+TAG 起動直後の最小確認は UART で行う。BLE 本取得の前に以下だけ見ればよい。
+
+WSL:
+
+```bash
+cd ~/work/ILGA
+./scripts/tag_log_capture.sh 10
+```
+
+確認観点:
+
+- `Bluetooth initialized`
+- `Advertising start requested (startup)`
+- `Advertising started (startup)`
+- 異常時は `Advertising failed ...` や BMI init failure の有無を見る
+
+### 2. BLE 受信開始と CSV 保存
+
+Windows PowerShell で BLE notify を受け、CSV を保存する。保存 CSV は `walking_analyzer` がそのまま読める列名で出力される。
+
+推奨保存先:
+
+- `logs/ble/`
+- 例: `logs/ble/walk_trial01.csv`
+
+Windows PowerShell:
+
+```powershell
+cd <ILGA working copy>\VIEWER\python\bmi270_BLE_viewer
+py -3 .\recv_bmi270_ble_notify_cli.py `
+  --name BMI270_BLE_SAMPLE `
+  --save-csv ..\..\..\logs\ble\walk_trial01.csv `
+  --duration-sec 30 `
+  --disconnect-on-finish
+```
+
+期待する PowerShell ログ:
+
+- `[BLE] found ...`
+- `[BLE] connected`
+- `[BLE] subscribe ACC ...`
+- `[BLE] subscribe GYR ...`
+- `[CSV] saving merged samples to ...`
+- `[BLE] notifications started; press Ctrl+C to stop`
+
+CSV 保存先の扱い:
+
+- 保存先は `--save-csv` で指定したパス
+- 親ディレクトリは存在しなければ自動作成される
+- 保存列は `seq,ax_mg,ay_mg,az_mg,gx_mdps,gy_mdps,gz_mdps`
+
+### 3. 再接続確認
+
+実歩行前に 1 回は切断後再接続を確認する。
+
+確認観点:
+
+- 1 回目の取得終了後、2 回目の scan で `BMI270_BLE_SAMPLE` が再発見できる
+- 2 回目の接続で再び CSV 保存を開始できる
+- UART 補助ログで以下の流れが見える
+  - `Disconnected: ...`
+  - `BMI ACC notify DISABLED (disconnect)`
+  - `BMI GYR notify DISABLED (disconnect)`
+  - `Advertising restart scheduled (disconnect, 200 ms)`
+  - `Advertising start requested (disconnect)`
+  - `Advertising started (disconnect)`
+
+### 4. 解析コマンド
+
+BLE 保存 CSV の解析は WSL で行う。`walking_analyzer` は BLE 保存 CSV をそのまま入力にできる。
+
+WSL:
+
+```bash
+cd ~/work/ILGA
+python3 VIEWER/python/walking_analyzer/analyze_single_leg_csv.py \
+  logs/ble/walk_trial01.csv \
+  --fs 100 \
+  --out-dir logs/ble/walk_trial01_analysis \
+  --plot logs/ble/walk_trial01_analysis/diagnostic.png
+```
+
+解析結果:
+
+- `summary.json`
+- `step_events.csv`
+- `diagnostic.png`
+
+`diagnostic.png` は歩行ピークと閾値のざっくり確認用で、取得直後の簡易診断に使う。
+
+### 5. 異常時の切り分け
+
+BLE 取得が不安定なときだけ UART を併用する。
+
+WSL:
+
+```bash
+cd ~/work/ILGA
+./scripts/tag_log_capture.sh 15
+```
+
+主な確認点:
+
+- advertising が再開しているか
+- notify enable / disable が想定どおりか
+- `Advertising failed ...` や notify error が出ていないか
+- BLE central 側で別端末が掴んでいないか
 
 ## ログポート
 
@@ -165,7 +322,7 @@ seq,ax,ay,az,gx,gy,gz
 
 - このリポジトリの実装では、中央機器未接続または未 subscribe 状態では notify は送られない
 - これまでの作業ではコード経路と payload 整合までは確認済み
-- 実際の over-the-air notify 受信は、中央機器での subscribe 実施が次の確認項目
+- over-the-air notify 受信、CSV 保存、切断後の再接続は確認済み
 
 ## 未解決事項 / 今後の確認項目
 
