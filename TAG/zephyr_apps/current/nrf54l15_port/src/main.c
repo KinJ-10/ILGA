@@ -94,6 +94,8 @@ static bool bmi_gyr_notify_enabled;
 static int bmi_acc_notify_last_ret = INT32_MIN;
 static int bmi_gyr_notify_last_ret = INT32_MIN;
 
+#define ADV_RESTART_DELAY_MS 200
+
 /* attribute pointers (set at runtime with bt_gatt_find_by_uuid) */
 static const struct bt_gatt_attr *bmi_acc_attr;
 static const struct bt_gatt_attr *bmi_gyr_attr;
@@ -420,16 +422,66 @@ static void mtu_updated(struct bt_conn *conn, uint16_t tx, uint16_t rx)
 static struct bt_gatt_cb gatt_callbacks = {
 	.att_mtu_updated = mtu_updated};
 
+static const char *advertising_restart_reason = "unknown";
+
+static void advertising_restart_work_handler(struct k_work *work);
+
+static K_WORK_DELAYABLE_DEFINE(advertising_restart_work,
+						 advertising_restart_work_handler);
+
+static int start_advertising(const char *reason)
+{
+	int err;
+
+	printk("Advertising start requested (%s)\n", reason);
+
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+							  sd, ARRAY_SIZE(sd));
+	if (err && err != -EALREADY)
+	{
+		printk("Advertising failed (%s, err=%d)\n", reason, err);
+		return err;
+	}
+
+	printk("Advertising started (%s)\n", reason);
+	return 0;
+}
+
+static void schedule_advertising_restart(const char *reason)
+{
+	advertising_restart_reason = reason;
+	k_work_reschedule(&advertising_restart_work,
+					  K_MSEC(ADV_RESTART_DELAY_MS));
+	printk("Advertising restart scheduled (%s, %d ms)\n", reason,
+		   ADV_RESTART_DELAY_MS);
+}
+
+static void advertising_restart_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	start_advertising(advertising_restart_reason);
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
+	char addr[BT_ADDR_LE_STR_LEN] = "(unknown)";
+
+	if (conn)
+	{
+		bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	}
+
 	if (err)
 	{
-		printk("Connection failed, err 0x%02x %s\n", err,
+		printk("Connection failed (%s), err 0x%02x %s\n", addr, err,
 			   bt_hci_err_to_str(err));
+		schedule_advertising_restart("connect-failed");
 		return;
 	}
 
-	printk("Connected\n");
+	printk("Connected: %s\n", addr);
+	k_work_cancel_delayable(&advertising_restart_work);
 
 	if (current_conn)
 	{
@@ -441,10 +493,15 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(conn);
+	char addr[BT_ADDR_LE_STR_LEN] = "(unknown)";
 
-	printk("Disconnected, reason 0x%02x %s\n", reason,
-		   bt_hci_err_to_str(reason));
+	if (conn)
+	{
+		bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	}
+
+	printk("Disconnected: %s, reason 0x%02x %s\n", addr, reason,
+			   bt_hci_err_to_str(reason));
 
 	if (current_conn)
 	{
@@ -452,8 +509,20 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		current_conn = NULL;
 	}
 
+	if (bmi_acc_notify_enabled)
+	{
+		printk("BMI ACC notify DISABLED (disconnect)\n");
+	}
+	if (bmi_gyr_notify_enabled)
+	{
+		printk("BMI GYR notify DISABLED (disconnect)\n");
+	}
+	bmi_acc_notify_enabled = false;
+	bmi_gyr_notify_enabled = false;
 	bmi_acc_notify_last_ret = INT32_MIN;
 	bmi_gyr_notify_last_ret = INT32_MIN;
+
+	schedule_advertising_restart("disconnect");
 }
 
 static void alert_stop(void) { printk("Alert stopped\n"); }
@@ -473,8 +542,6 @@ BT_IAS_CB_DEFINE(ias_callbacks) = {
 
 static void bt_ready(void)
 {
-	int err;
-
 	printk("Bluetooth initialized\n");
 
 	if (IS_ENABLED(CONFIG_SETTINGS))
@@ -482,15 +549,7 @@ static void bt_ready(void)
 		settings_load();
 	}
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
-						  sd, ARRAY_SIZE(sd));
-	if (err)
-	{
-		printk("Advertising failed to start (err %d)\n", err);
-		return;
-	}
-
-	printk("Advertising successfully started\n");
+	start_advertising("startup");
 }
 
 static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
