@@ -11,6 +11,12 @@
   - LOCATOR
   - VIEWER
 
+## 引継ぎ情報
+- 現在の到達点と未完了項目は `docs/CURRENT_STATUS.md` を確認する。
+- Codex Desktop / CLI の環境構成と確認手順は `docs/CODEX_DESKTOP_HANDOVER.md` を確認する。
+- ILGA の仕様判断では、2026-03-16版の共通基準文書を上位の基準とする。
+- 実装と基準文書が矛盾する場合は、矛盾を明示し、勝手に仕様を変更しない。
+
 ## 基本方針
 - Human steers, agent executes. を基本とする。
 - 変更は小さく、検証しやすい単位を優先する。

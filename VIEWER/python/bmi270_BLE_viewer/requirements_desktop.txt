@@ -1,0 +1,3 @@
+bleak==2.1.1
+matplotlib>=3.7,<4
+numpy>=1.24,<3
