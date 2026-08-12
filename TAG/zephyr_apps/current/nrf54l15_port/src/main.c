@@ -7,10 +7,11 @@
  * What this does:
  * - Starts BLE advertising (based on the BLE sample)
  * - Keeps the sample services (BAS/HRS/CTS/IAS + Vendor service)
- * - Adds two NOTIFY characteristics to the Vendor service:
- *     * Accel (mg):  seq(uint32) + ax/ay/az(int16)
- *     * Gyro (mdps): seq(uint32) + gx/gy/gz(int32)
- * - Polls BMI270 at ~100Hz, prints CSV to UART, and notifies when enabled.
+ * - Adds one combined BMI270 NOTIFY characteristic:
+ *     version(uint8) + seq(uint32 LE) + accel(3 x int16 LE, mg)
+ *     + gyro(3 x int32 LE, mdps)
+ * - Polls BMI270 on an absolute 10 ms schedule and queues BLE transmission
+ *   to a separate thread so Bluetooth backpressure cannot stop acquisition.
  *
  * Notes:
  * - DEVICE_DT_GET_ONE(bosch_bmi270) will compile-time fail if BMI270 node
@@ -27,9 +28,11 @@
 
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/devicetree.h>
 
@@ -67,14 +70,20 @@ static const struct bt_uuid_128 vnd_enc_uuid = BT_UUID_INIT_128(
 static const struct bt_uuid_128 vnd_auth_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef2));
 
-/* ---- Added: BMI270 streaming characteristics (NOTIFY) ---- */
-/* Accel notify char UUID */
+/* Legacy READ-only characteristics. */
 static const struct bt_uuid_128 bmi_acc_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef11));
 
-/* Gyro notify char UUID */
 static const struct bt_uuid_128 bmi_gyr_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef12));
+
+/* Combined BMI270 stream UUID. */
+static const struct bt_uuid_128 bmi_stream_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef13));
+
+#define BMI_STREAM_VERSION 1U
+#define BMI_STREAM_PAYLOAD_SIZE 23U
+#define BMI_BLE_QUEUE_CAPACITY 64U
 
 #define VND_MAX_LEN 20
 #define BT_HR_HEARTRATE_DEFAULT_MIN 90U
@@ -87,18 +96,33 @@ static uint8_t vnd_wwr_value[VND_MAX_LEN + 1] = {'V', 'e', 'n', 'd', 'o', 'r'};
 /* Last BMI data (for READ) */
 static uint8_t bmi_acc_last[10]; /* seq u32 + 3x i16 = 10 bytes */
 static uint8_t bmi_gyr_last[16]; /* seq u32 + 3x i32 = 16 bytes */
+static uint8_t bmi_stream_last[BMI_STREAM_PAYLOAD_SIZE];
 
-/* notification enable flags */
-static bool bmi_acc_notify_enabled;
-static bool bmi_gyr_notify_enabled;
-static int bmi_acc_notify_last_ret = INT32_MIN;
-static int bmi_gyr_notify_last_ret = INT32_MIN;
+struct bmi_sample
+{
+	uint32_t seq;
+	int16_t ax_mg;
+	int16_t ay_mg;
+	int16_t az_mg;
+	int32_t gx_mdps;
+	int32_t gy_mdps;
+	int32_t gz_mdps;
+};
+
+K_MSGQ_DEFINE(bmi_ble_queue, sizeof(struct bmi_sample),
+		 BMI_BLE_QUEUE_CAPACITY, 4);
+K_MUTEX_DEFINE(current_conn_mutex);
+
+static atomic_t bmi_stream_notify_enabled;
+static atomic_t bmi_stream_connected;
+static atomic_t bmi_stream_notify_last_ret = ATOMIC_INIT(INT32_MIN);
 
 #define ADV_RESTART_DELAY_MS 200
 
 /* attribute pointers (set at runtime with bt_gatt_find_by_uuid) */
 static const struct bt_gatt_attr *bmi_acc_attr;
 static const struct bt_gatt_attr *bmi_gyr_attr;
+static const struct bt_gatt_attr *bmi_stream_attr;
 
 /* keep current connection */
 static struct bt_conn *current_conn;
@@ -144,21 +168,26 @@ static ssize_t read_bmi_gyr(struct bt_conn *conn, const struct bt_gatt_attr *att
 							 bmi_gyr_last, sizeof(bmi_gyr_last));
 }
 
-/* CCC callbacks (enable notify flags) */
-static void bmi_acc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+static ssize_t read_bmi_stream(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				       void *buf, uint16_t len, uint16_t offset)
 {
-	ARG_UNUSED(attr);
-	bmi_acc_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
-	bmi_acc_notify_last_ret = INT32_MIN;
-	printk("BMI ACC notify %s\n", bmi_acc_notify_enabled ? "ENABLED" : "DISABLED");
+	return bt_gatt_attr_read(conn, attr, buf, len, offset,
+				 bmi_stream_last, sizeof(bmi_stream_last));
 }
 
-static void bmi_gyr_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+static void bmi_stream_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
-	bmi_gyr_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
-	bmi_gyr_notify_last_ret = INT32_MIN;
-	printk("BMI GYR notify %s\n", bmi_gyr_notify_enabled ? "ENABLED" : "DISABLED");
+	bool enabled = (value == BT_GATT_CCC_NOTIFY);
+
+	atomic_clear(&bmi_stream_notify_enabled);
+	k_msgq_purge(&bmi_ble_queue);
+	atomic_set(&bmi_stream_notify_last_ret, INT32_MIN);
+	if (enabled)
+	{
+		atomic_set(&bmi_stream_notify_enabled, 1);
+	}
+	printk("BMI stream notify %s\n", enabled ? "ENABLED" : "DISABLED");
 }
 
 /* Vendor service indication simulation (original) */
@@ -366,20 +395,23 @@ BT_GATT_SERVICE_DEFINE(vnd_svc,
 											  BT_GATT_PERM_READ_AUTHEN | BT_GATT_PERM_WRITE_AUTHEN,
 											  read_vnd, write_vnd, vnd_auth_value),
 
-					   /* ACC notify */
+					   /* Legacy ACC/GYR READ values retained for GATT compatibility. */
 					   BT_GATT_CHARACTERISTIC(&bmi_acc_uuid.uuid,
-											  BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-											  BT_GATT_PERM_READ,
-											  read_bmi_acc, NULL, bmi_acc_last),
-					   BT_GATT_CCC(bmi_acc_ccc_cfg_changed,
-								   BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+										  BT_GATT_CHRC_READ,
+										  BT_GATT_PERM_READ,
+										  read_bmi_acc, NULL, bmi_acc_last),
 
-					   /* GYR notify */
 					   BT_GATT_CHARACTERISTIC(&bmi_gyr_uuid.uuid,
-											  BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-											  BT_GATT_PERM_READ,
-											  read_bmi_gyr, NULL, bmi_gyr_last),
-					   BT_GATT_CCC(bmi_gyr_ccc_cfg_changed,
+										  BT_GATT_CHRC_READ,
+										  BT_GATT_PERM_READ,
+										  read_bmi_gyr, NULL, bmi_gyr_last),
+
+					   /* Versioned combined ACC/GYR notification. */
+					   BT_GATT_CHARACTERISTIC(&bmi_stream_uuid.uuid,
+										  BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+										  BT_GATT_PERM_READ,
+										  read_bmi_stream, NULL, bmi_stream_last),
+					   BT_GATT_CCC(bmi_stream_ccc_cfg_changed,
 								   BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 
 					   /* Long/reliable write */
@@ -424,6 +456,13 @@ static struct bt_gatt_cb gatt_callbacks = {
 
 static const char *advertising_restart_reason = "unknown";
 
+static const struct bt_le_conn_param preferred_conn_params = {
+	.interval_min = 6,  /* 7.5 ms */
+	.interval_max = 12, /* 15 ms */
+	.latency = 0,
+	.timeout = 400, /* 4 s */
+};
+
 static void advertising_restart_work_handler(struct k_work *work);
 
 static K_WORK_DELAYABLE_DEFINE(advertising_restart_work,
@@ -463,6 +502,71 @@ static void advertising_restart_work_handler(struct k_work *work)
 	start_advertising(advertising_restart_reason);
 }
 
+static void print_connection_diagnostics(struct bt_conn *conn, const char *reason)
+{
+	struct bt_conn_info info;
+	int err = bt_conn_get_info(conn, &info);
+
+	if (err)
+	{
+		printk("BLE_DIAG info err=%d reason=%s\n", err, reason);
+		return;
+	}
+
+	printk("BLE_DIAG link reason=%s interval_us=%u latency=%u timeout_10ms=%u\n",
+		   reason, (unsigned int)info.le.interval_us,
+		   (unsigned int)info.le.latency, (unsigned int)info.le.timeout);
+
+#if defined(CONFIG_BT_USER_PHY_UPDATE)
+	if (info.le.phy)
+	{
+		printk("BLE_DIAG phy reason=%s tx=%u rx=%u\n", reason,
+			   (unsigned int)info.le.phy->tx_phy,
+			   (unsigned int)info.le.phy->rx_phy);
+	}
+#endif
+
+#if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
+	if (info.le.data_len)
+	{
+		printk("BLE_DIAG data_len reason=%s tx=%u/%uus rx=%u/%uus\n", reason,
+			   (unsigned int)info.le.data_len->tx_max_len,
+			   (unsigned int)info.le.data_len->tx_max_time,
+			   (unsigned int)info.le.data_len->rx_max_len,
+			   (unsigned int)info.le.data_len->rx_max_time);
+	}
+#endif
+}
+
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+				 uint16_t latency, uint16_t timeout)
+{
+	ARG_UNUSED(conn);
+	printk("BLE_DIAG param_updated interval_us=%u latency=%u timeout_10ms=%u\n",
+		   (unsigned int)BT_CONN_INTERVAL_TO_US(interval),
+		   (unsigned int)latency, (unsigned int)timeout);
+}
+
+#if defined(CONFIG_BT_USER_PHY_UPDATE)
+static void le_phy_updated(struct bt_conn *conn, struct bt_conn_le_phy_info *param)
+{
+	ARG_UNUSED(conn);
+	printk("BLE_DIAG phy_updated tx=%u rx=%u\n",
+		   (unsigned int)param->tx_phy, (unsigned int)param->rx_phy);
+}
+#endif
+
+#if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
+static void le_data_len_updated(struct bt_conn *conn,
+					struct bt_conn_le_data_len_info *info)
+{
+	ARG_UNUSED(conn);
+	printk("BLE_DIAG data_len_updated tx=%u/%uus rx=%u/%uus\n",
+		   (unsigned int)info->tx_max_len, (unsigned int)info->tx_max_time,
+		   (unsigned int)info->rx_max_len, (unsigned int)info->rx_max_time);
+}
+#endif
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	char addr[BT_ADDR_LE_STR_LEN] = "(unknown)";
@@ -483,12 +587,20 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	printk("Connected: %s\n", addr);
 	k_work_cancel_delayable(&advertising_restart_work);
 
+	k_mutex_lock(&current_conn_mutex, K_FOREVER);
 	if (current_conn)
 	{
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
 	current_conn = bt_conn_ref(conn);
+	k_mutex_unlock(&current_conn_mutex);
+	atomic_set(&bmi_stream_connected, 1);
+	print_connection_diagnostics(conn, "connected");
+
+	int update_err = bt_conn_le_param_update(conn, &preferred_conn_params);
+	printk("BLE_DIAG param_request interval_us=7500-15000 latency=0 "
+	       "timeout_10ms=400 ret=%d\n", update_err);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -503,24 +615,19 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	printk("Disconnected: %s, reason 0x%02x %s\n", addr, reason,
 			   bt_hci_err_to_str(reason));
 
+	atomic_clear(&bmi_stream_connected);
+	atomic_clear(&bmi_stream_notify_enabled);
+	k_msgq_purge(&bmi_ble_queue);
+
+	k_mutex_lock(&current_conn_mutex, K_FOREVER);
 	if (current_conn)
 	{
 		bt_conn_unref(current_conn);
 		current_conn = NULL;
 	}
-
-	if (bmi_acc_notify_enabled)
-	{
-		printk("BMI ACC notify DISABLED (disconnect)\n");
-	}
-	if (bmi_gyr_notify_enabled)
-	{
-		printk("BMI GYR notify DISABLED (disconnect)\n");
-	}
-	bmi_acc_notify_enabled = false;
-	bmi_gyr_notify_enabled = false;
-	bmi_acc_notify_last_ret = INT32_MIN;
-	bmi_gyr_notify_last_ret = INT32_MIN;
+	k_mutex_unlock(&current_conn_mutex);
+	atomic_set(&bmi_stream_notify_last_ret, INT32_MIN);
+	printk("BMI stream notify DISABLED (disconnect)\n");
 
 	schedule_advertising_restart("disconnect");
 }
@@ -532,6 +639,13 @@ static void alert_high_start(void) { printk("High alert started\n"); }
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.le_param_updated = le_param_updated,
+#if defined(CONFIG_BT_USER_PHY_UPDATE)
+	.le_phy_updated = le_phy_updated,
+#endif
+#if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
+	.le_data_len_updated = le_data_len_updated,
+#endif
 };
 
 BT_IAS_CB_DEFINE(ias_callbacks) = {
@@ -671,12 +785,190 @@ static struct bt_hrs_cb hrs_cb = {
 
 #define BMI_THREAD_STACK_SIZE 1024
 #define BMI_THREAD_PRIORITY 5
+#define BMI_BLE_THREAD_STACK_SIZE 1024
+#define BMI_BLE_THREAD_PRIORITY 6
+#define BMI_DIAG_THREAD_STACK_SIZE 1024
+#define BMI_DIAG_THREAD_PRIORITY 7
+#define BMI_SAMPLE_PERIOD_MS 10
+#define BMI_DIAG_INTERVAL_MS 5000
+#define BMI270_REG_CHIP_ID 0x00
+#define BMI270_REG_ACC_CONF 0x40
+#define BMI270_REG_GYR_CONF 0x42
+#define BMI270_ODR_MASK 0x0F
 
 #if DT_HAS_COMPAT_STATUS_OKAY(bosch_bmi270)
+#define BMI270_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(bosch_bmi270)
 static const struct device *const bmi = DEVICE_DT_GET_ONE(bosch_bmi270);
+static const struct i2c_dt_spec bmi_i2c = I2C_DT_SPEC_GET(BMI270_NODE);
 #else
 #warning "No BMI270 instance found in devicetree (compatible = \"bosch,bmi270\")"
 #define bmi NULL
+#endif
+
+struct bmi_timing_metrics
+{
+	uint64_t period_total_us;
+	uint64_t fetch_total_us;
+	uint64_t process_total_us;
+	uint64_t active_total_us;
+	uint64_t notify_total_us;
+	uint32_t period_max_us;
+	uint32_t fetch_max_us;
+	uint32_t process_max_us;
+	uint32_t active_max_us;
+	uint32_t notify_max_us;
+	uint32_t deadline_late_max_us;
+	uint32_t periods;
+	uint32_t fetch_calls;
+	uint32_t samples;
+	uint32_t fetch_errors;
+	uint32_t deadline_overruns;
+	uint32_t skipped_periods;
+	uint32_t queue_depth_max;
+	uint32_t queue_dropped;
+	uint32_t notify_ok;
+	uint32_t notify_errors;
+};
+
+static struct bmi_timing_metrics bmi_metrics;
+static struct k_spinlock bmi_metrics_lock;
+
+static uint32_t cycles_since_us(uint64_t start_cycles)
+{
+	return (uint32_t)k_cyc_to_us_floor64(k_cycle_get_64() - start_cycles);
+}
+
+static void timing_add(uint64_t *total_us, uint32_t *max_us, uint32_t elapsed_us)
+{
+	*total_us += elapsed_us;
+	if (elapsed_us > *max_us)
+	{
+		*max_us = elapsed_us;
+	}
+}
+
+static uint32_t timing_average(uint64_t total_us, uint32_t count)
+{
+	return count ? (uint32_t)(total_us / count) : 0U;
+}
+
+static void bmi_metrics_record_acquisition(uint32_t period_us, bool period_valid,
+					   uint32_t fetch_us, uint32_t process_us,
+					   uint32_t active_us, bool success)
+{
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	if (period_valid)
+	{
+		timing_add(&bmi_metrics.period_total_us, &bmi_metrics.period_max_us,
+			   period_us);
+		bmi_metrics.periods++;
+	}
+	timing_add(&bmi_metrics.fetch_total_us, &bmi_metrics.fetch_max_us, fetch_us);
+	bmi_metrics.fetch_calls++;
+	if (success)
+	{
+		timing_add(&bmi_metrics.process_total_us, &bmi_metrics.process_max_us,
+			   process_us);
+		timing_add(&bmi_metrics.active_total_us, &bmi_metrics.active_max_us,
+			   active_us);
+		bmi_metrics.samples++;
+	}
+	else
+	{
+		bmi_metrics.fetch_errors++;
+	}
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+}
+
+static void bmi_metrics_record_overrun(uint32_t late_us, uint32_t skipped)
+{
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	bmi_metrics.deadline_overruns++;
+	bmi_metrics.skipped_periods += skipped;
+	if (late_us > bmi_metrics.deadline_late_max_us)
+	{
+		bmi_metrics.deadline_late_max_us = late_us;
+	}
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+}
+
+static void bmi_metrics_record_queue_depth(uint32_t depth)
+{
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	if (depth > bmi_metrics.queue_depth_max)
+	{
+		bmi_metrics.queue_depth_max = depth;
+	}
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+}
+
+static void bmi_metrics_record_queue_drop(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	bmi_metrics.queue_dropped++;
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+}
+
+static void bmi_metrics_record_notify(uint32_t elapsed_us, int ret)
+{
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	timing_add(&bmi_metrics.notify_total_us, &bmi_metrics.notify_max_us,
+		   elapsed_us);
+	if (ret == 0)
+	{
+		bmi_metrics.notify_ok++;
+	}
+	else
+	{
+		bmi_metrics.notify_errors++;
+	}
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+}
+
+static struct bmi_timing_metrics bmi_metrics_take_snapshot(void)
+{
+	struct bmi_timing_metrics snapshot;
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	snapshot = bmi_metrics;
+	memset(&bmi_metrics, 0, sizeof(bmi_metrics));
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+	return snapshot;
+}
+
+#if DT_HAS_COMPAT_STATUS_OKAY(bosch_bmi270)
+static void bmi_diag_print_registers(void)
+{
+	uint8_t chip_id;
+	uint8_t acc_conf;
+	uint8_t gyr_conf;
+	int chip_ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_CHIP_ID, &chip_id);
+	int acc_ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_ACC_CONF, &acc_conf);
+	int gyr_ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_GYR_CONF, &gyr_conf);
+
+	if (chip_ret || acc_ret || gyr_ret)
+	{
+		printk("BMI_DIAG register_read err chip=%d acc=%d gyr=%d\n",
+			   chip_ret, acc_ret, gyr_ret);
+		return;
+	}
+
+	printk("BMI_DIAG registers chip_id=0x%02x acc_conf=0x%02x acc_odr=0x%x "
+		   "gyr_conf=0x%02x gyr_odr=0x%x\n",
+		   chip_id, acc_conf, acc_conf & BMI270_ODR_MASK,
+		   gyr_conf, gyr_conf & BMI270_ODR_MASK);
+}
 #endif
 
 static void pack_and_store_acc(uint32_t seq, int16_t ax_mg, int16_t ay_mg, int16_t az_mg)
@@ -693,6 +985,157 @@ static void pack_and_store_gyr(uint32_t seq, int32_t gx_mdps, int32_t gy_mdps, i
 	sys_put_le32((uint32_t)gx_mdps, &bmi_gyr_last[4]);
 	sys_put_le32((uint32_t)gy_mdps, &bmi_gyr_last[8]);
 	sys_put_le32((uint32_t)gz_mdps, &bmi_gyr_last[12]);
+}
+
+/*
+ * Wire format is exactly 23 bytes with no C struct padding:
+ *   [0] version (1)
+ *   [1..4] seq (u32 LE)
+ *   [5..10] ax/ay/az (3 x i16 LE, mg)
+ *   [11..22] gx/gy/gz (3 x i32 LE, mdps)
+ */
+static void pack_bmi_stream(const struct bmi_sample *sample, uint8_t *payload)
+{
+	payload[0] = BMI_STREAM_VERSION;
+	sys_put_le32(sample->seq, &payload[1]);
+	sys_put_le16((uint16_t)sample->ax_mg, &payload[5]);
+	sys_put_le16((uint16_t)sample->ay_mg, &payload[7]);
+	sys_put_le16((uint16_t)sample->az_mg, &payload[9]);
+	sys_put_le32((uint32_t)sample->gx_mdps, &payload[11]);
+	sys_put_le32((uint32_t)sample->gy_mdps, &payload[15]);
+	sys_put_le32((uint32_t)sample->gz_mdps, &payload[19]);
+}
+
+static void bmi_ble_enqueue(const struct bmi_sample *sample)
+{
+	if (!atomic_get(&bmi_stream_connected) ||
+	    !atomic_get(&bmi_stream_notify_enabled))
+	{
+		return;
+	}
+
+	int ret = k_msgq_put(&bmi_ble_queue, sample, K_NO_WAIT);
+	if (ret != 0)
+	{
+		struct bmi_sample oldest;
+
+		/* Preserve the newest sensor data: discard one oldest queued sample. */
+		if (k_msgq_get(&bmi_ble_queue, &oldest, K_NO_WAIT) == 0)
+		{
+			bmi_metrics_record_queue_drop();
+		}
+
+		ret = k_msgq_put(&bmi_ble_queue, sample, K_NO_WAIT);
+		if (ret != 0)
+		{
+			/* A concurrent purge/disconnect can still make this sample unsendable. */
+			bmi_metrics_record_queue_drop();
+			return;
+		}
+	}
+
+	bmi_metrics_record_queue_depth(k_msgq_num_used_get(&bmi_ble_queue));
+}
+
+static void bmi_ble_thread(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	while (1)
+	{
+		struct bmi_sample sample;
+		uint8_t payload[BMI_STREAM_PAYLOAD_SIZE];
+
+		if (k_msgq_get(&bmi_ble_queue, &sample, K_FOREVER) != 0)
+		{
+			continue;
+		}
+		if (!atomic_get(&bmi_stream_connected) ||
+		    !atomic_get(&bmi_stream_notify_enabled) || !bmi_stream_attr)
+		{
+			continue;
+		}
+
+		k_mutex_lock(&current_conn_mutex, K_FOREVER);
+		struct bt_conn *conn = current_conn ? bt_conn_ref(current_conn) : NULL;
+		k_mutex_unlock(&current_conn_mutex);
+		if (!conn)
+		{
+			continue;
+		}
+
+		pack_bmi_stream(&sample, payload);
+		uint64_t notify_start_cycles = k_cycle_get_64();
+		int notify_ret = bt_gatt_notify(conn, bmi_stream_attr,
+						 payload, sizeof(payload));
+		uint32_t notify_us = cycles_since_us(notify_start_cycles);
+		bt_conn_unref(conn);
+
+		bmi_metrics_record_notify(notify_us, notify_ret);
+		if (notify_ret != atomic_get(&bmi_stream_notify_last_ret))
+		{
+			if (notify_ret == 0)
+			{
+				printk("BMI stream notify active (%u bytes)\n",
+				       (unsigned int)sizeof(payload));
+			}
+			else
+			{
+				printk("BMI stream notify err=%d\n", notify_ret);
+			}
+			atomic_set(&bmi_stream_notify_last_ret, notify_ret);
+		}
+	}
+}
+
+static void bmi_diag_thread(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	int64_t window_start_ms = k_uptime_get();
+
+	while (1)
+	{
+		k_sleep(K_MSEC(BMI_DIAG_INTERVAL_MS));
+
+		int64_t now_ms = k_uptime_get();
+		int64_t elapsed_ms = now_ms - window_start_ms;
+		window_start_ms = now_ms;
+		struct bmi_timing_metrics metrics = bmi_metrics_take_snapshot();
+		uint32_t queue_depth = k_msgq_num_used_get(&bmi_ble_queue);
+		uint32_t rate_millihz = elapsed_ms > 0
+			? (uint32_t)(((uint64_t)metrics.samples * 1000000U) /
+				     (uint64_t)elapsed_ms)
+			: 0U;
+		uint32_t notify_calls = metrics.notify_ok + metrics.notify_errors;
+
+		printk("BMI_DIAG window_ms=%lld samples=%u rate_millihz=%u fetch_err=%u\n",
+		       elapsed_ms, metrics.samples, rate_millihz, metrics.fetch_errors);
+		printk("BMI_DIAG timing_us period_avg=%u period_max=%u fetch_avg=%u "
+		       "fetch_max=%u process_avg=%u process_max=%u active_avg=%u "
+		       "active_max=%u\n",
+		       timing_average(metrics.period_total_us, metrics.periods),
+		       metrics.period_max_us,
+		       timing_average(metrics.fetch_total_us, metrics.fetch_calls),
+		       metrics.fetch_max_us,
+		       timing_average(metrics.process_total_us, metrics.samples),
+		       metrics.process_max_us,
+		       timing_average(metrics.active_total_us, metrics.samples),
+		       metrics.active_max_us);
+		printk("BMI_DIAG schedule overrun=%u skipped=%u late_max_us=%u\n",
+		       metrics.deadline_overruns, metrics.skipped_periods,
+		       metrics.deadline_late_max_us);
+		printk("BMI_DIAG ble queue_depth=%u queue_max=%u dropped=%u "
+		       "notify_ok=%u notify_err=%u notify_avg_us=%u notify_max_us=%u\n",
+		       queue_depth, metrics.queue_depth_max, metrics.queue_dropped,
+		       metrics.notify_ok, metrics.notify_errors,
+		       timing_average(metrics.notify_total_us, notify_calls),
+		       metrics.notify_max_us);
+	}
 }
 
 static void bmi_thread(void *p1, void *p2, void *p3)
@@ -754,17 +1197,40 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 	printk("attr gyro OVERSAMPLING ret=%d\n", ret);
 	ret = sensor_attr_set(bmi, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &sampling_freq);
 	printk("attr gyro SAMPLING_FREQ ret=%d\n", ret);
+	bmi_diag_print_registers();
+
+	const int64_t period_ticks = k_ms_to_ticks_ceil64(BMI_SAMPLE_PERIOD_MS);
+	int64_t next_release_ticks = k_uptime_ticks();
+	uint64_t previous_sample_start_cycles = 0U;
 
 	while (1)
 	{
+		int64_t now_ticks = k_uptime_ticks();
+		if (now_ticks < next_release_ticks)
+		{
+			k_sleep(K_TIMEOUT_ABS_TICKS(next_release_ticks));
+		}
+
+		uint64_t sample_start_cycles = k_cycle_get_64();
+		uint32_t period_us = previous_sample_start_cycles
+			? (uint32_t)k_cyc_to_us_floor64(sample_start_cycles -
+							       previous_sample_start_cycles)
+			: 0U;
+		bool period_valid = previous_sample_start_cycles != 0U;
+		previous_sample_start_cycles = sample_start_cycles;
+		uint64_t stage_start_cycles = k_cycle_get_64();
 		int err = sensor_sample_fetch(bmi);
+		uint32_t fetch_us = cycles_since_us(stage_start_cycles);
 		if (err)
 		{
 			printk("sensor_sample_fetch err=%d\n", err);
-			k_msleep(10);
-			continue;
+			bmi_metrics_record_acquisition(period_us, period_valid, fetch_us,
+						       0U, cycles_since_us(sample_start_cycles),
+						       false);
+			goto schedule_next_sample;
 		}
 
+		stage_start_cycles = k_cycle_get_64();
 		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_XYZ, acc);
 		sensor_channel_get(bmi, SENSOR_CHAN_GYRO_XYZ, gyr);
 
@@ -794,59 +1260,40 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 		int16_t ay_mg = (int16_t)ay_mg32;
 		int16_t az_mg = (int16_t)az_mg32;
 
-		/* store for READ */
+		struct bmi_sample sample = {
+			.seq = seq,
+			.ax_mg = ax_mg,
+			.ay_mg = ay_mg,
+			.az_mg = az_mg,
+			.gx_mdps = gx_mdps,
+			.gy_mdps = gy_mdps,
+			.gz_mdps = gz_mdps,
+		};
+
+		/* Store legacy READ values and the combined READ/notify payload. */
 		pack_and_store_acc(seq, ax_mg, ay_mg, az_mg);
 		pack_and_store_gyr(seq, gx_mdps, gy_mdps, gz_mdps);
+		pack_bmi_stream(&sample, bmi_stream_last);
+		uint32_t process_us = cycles_since_us(stage_start_cycles);
+		uint32_t active_us = cycles_since_us(sample_start_cycles);
 
-		/* UART CSV line: seq, accel mg, gyro mdps */
-		printk("%u,%d,%d,%d,%d,%d,%d\n",
-			   seq,
-			   (int)ax_mg, (int)ay_mg, (int)az_mg,
-			   (int)gx_mdps, (int)gy_mdps, (int)gz_mdps);
-
-		/* BLE notify */
-		if (current_conn)
-		{
-			if (bmi_acc_notify_enabled && bmi_acc_attr)
-			{
-				int notify_ret = bt_gatt_notify(current_conn, bmi_acc_attr,
-										 bmi_acc_last, sizeof(bmi_acc_last));
-				if (notify_ret != bmi_acc_notify_last_ret)
-				{
-					if (notify_ret == 0)
-					{
-						printk("BMI ACC notify active (%u bytes)\n",
-							   (unsigned int)sizeof(bmi_acc_last));
-					}
-					else
-					{
-						printk("BMI ACC notify err=%d\n", notify_ret);
-					}
-					bmi_acc_notify_last_ret = notify_ret;
-				}
-			}
-			if (bmi_gyr_notify_enabled && bmi_gyr_attr)
-			{
-				int notify_ret = bt_gatt_notify(current_conn, bmi_gyr_attr,
-										 bmi_gyr_last, sizeof(bmi_gyr_last));
-				if (notify_ret != bmi_gyr_notify_last_ret)
-				{
-					if (notify_ret == 0)
-					{
-						printk("BMI GYR notify active (%u bytes)\n",
-							   (unsigned int)sizeof(bmi_gyr_last));
-					}
-					else
-					{
-						printk("BMI GYR notify err=%d\n", notify_ret);
-					}
-					bmi_gyr_notify_last_ret = notify_ret;
-				}
-			}
-		}
-
+		bmi_metrics_record_acquisition(period_us, period_valid, fetch_us,
+						   process_us, active_us, true);
+		bmi_ble_enqueue(&sample);
 		seq++;
-		k_msleep(10); /* ~100Hz */
+
+schedule_next_sample:
+		next_release_ticks += period_ticks;
+		now_ticks = k_uptime_ticks();
+		if (now_ticks > next_release_ticks)
+		{
+			int64_t late_ticks = now_ticks - next_release_ticks;
+			uint32_t skipped = (uint32_t)(late_ticks / period_ticks) + 1U;
+			uint32_t late_us = (uint32_t)k_ticks_to_us_floor64(late_ticks);
+
+			bmi_metrics_record_overrun(late_us, skipped);
+			next_release_ticks += (int64_t)skipped * period_ticks;
+		}
 	}
 #endif
 }
@@ -856,6 +1303,18 @@ K_THREAD_DEFINE(bmi_thread_id,
 				bmi_thread,
 				NULL, NULL, NULL,
 				BMI_THREAD_PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(bmi_ble_thread_id,
+				BMI_BLE_THREAD_STACK_SIZE,
+				bmi_ble_thread,
+				NULL, NULL, NULL,
+				BMI_BLE_THREAD_PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(bmi_diag_thread_id,
+				BMI_DIAG_THREAD_STACK_SIZE,
+				bmi_diag_thread,
+				NULL, NULL, NULL,
+				BMI_DIAG_THREAD_PRIORITY, 0, 0);
 
 /* ============================================================
  * main()
@@ -874,7 +1333,6 @@ int main(void)
 		return 0;
 	}
 
-	bt_ready();
 	bt_cts_init(&cts_cb);
 	bt_hrs_cb_register(&hrs_cb);
 
@@ -890,11 +1348,19 @@ int main(void)
 	/* find BMI characteristic value attributes */
 	bmi_acc_attr = bt_gatt_find_by_uuid(vnd_svc.attrs, vnd_svc.attr_count, &bmi_acc_uuid.uuid);
 	bmi_gyr_attr = bt_gatt_find_by_uuid(vnd_svc.attrs, vnd_svc.attr_count, &bmi_gyr_uuid.uuid);
+	bmi_stream_attr = bt_gatt_find_by_uuid(vnd_svc.attrs, vnd_svc.attr_count,
+					       &bmi_stream_uuid.uuid);
 
 	bt_uuid_to_str(&bmi_acc_uuid.uuid, str, sizeof(str));
 	printk("BMI ACC attr %p (UUID %s)\n", bmi_acc_attr, str);
 	bt_uuid_to_str(&bmi_gyr_uuid.uuid, str, sizeof(str));
 	printk("BMI GYR attr %p (UUID %s)\n", bmi_gyr_attr, str);
+	bt_uuid_to_str(&bmi_stream_uuid.uuid, str, sizeof(str));
+	printk("BMI stream attr %p (UUID %s, version=%u, payload=%u bytes)\n",
+	       bmi_stream_attr, str, BMI_STREAM_VERSION, BMI_STREAM_PAYLOAD_SIZE);
+
+	/* Start advertising only after all stream attributes are ready. */
+	bt_ready();
 
 	/* keep original demo periodic notifications (1Hz) */
 	while (1)

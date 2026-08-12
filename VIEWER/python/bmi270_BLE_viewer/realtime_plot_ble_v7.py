@@ -5,6 +5,7 @@ Changes from v6:
 - Plot timestamps use *arrival wall time* (item.t) so the graph updates even if the real rate is not 100 Hz.
 - Still uses seq to detect drops (seq gaps).
 - Shows estimated rate (based on samples received per second) + drops.
+- Uses the version-1 combined ACC/GYR notification introduced for 100 Hz streaming.
 
 Why this matters:
 - In v6 we used seq-based time assuming EXPECTED_HZ=100.
@@ -52,7 +53,10 @@ G0 = 9.80665
 # ACC payload unit mode:
 #  - 'mg'         : ax/ay/az are milli-g (1g ≈ 1000)
 #  - 'mps2_milli'  : ax/ay/az are milli-(m/s^2) (1g ≈ 9806.65)
-ACC_PAYLOAD_MODE = 'mps2_milli'
+ACC_PAYLOAD_MODE = 'mg'
+
+STREAM_VERSION = 1
+STREAM_STRUCT = struct.Struct("<BIhhhiii")
 
 # Windows (Bleak WinRT) stability knobs:
 # - use_cached_services: False avoids stale GATT cache causing "Could not get GATT services: Unreachable"
@@ -71,18 +75,12 @@ def bleak_version() -> str:
 
 
 @dataclass
-class AccSample:
+class CombinedSample:
     t: float
     seq: int
     ax_mg: int
     ay_mg: int
     az_mg: int
-
-
-@dataclass
-class GyrSample:
-    t: float
-    seq: int
     gx_mdps: int
     gy_mdps: int
     gz_mdps: int
@@ -132,18 +130,14 @@ def _uuid_suffix(u: str) -> str:
     return u.split("-")[-1]
 
 
-def _pick_acc_gyr_chars(chars: List) -> Tuple[Optional[str], Optional[str]]:
-    acc_uuid = None
-    gyr_uuid = None
+def _pick_stream_char(chars: List) -> Optional[str]:
     for ch in chars:
         if not getattr(ch, "uuid", None):
             continue
         su = _uuid_suffix(ch.uuid)
-        if su.endswith("ef11") or su.endswith("de11"):
-            acc_uuid = ch.uuid
-        if su.endswith("ef12") or su.endswith("de12"):
-            gyr_uuid = ch.uuid
-    return acc_uuid, gyr_uuid
+        if su.endswith("ef13") or su.endswith("de13"):
+            return ch.uuid
+    return None
 
 
 async def _get_services_compat(client: BleakClient):
@@ -242,9 +236,9 @@ async def ble_worker(sample_q: Queue, stop_evt: threading.Event) -> None:
             for ch in s.characteristics:
                 all_chars.append(ch)
 
-        acc_uuid, gyr_uuid = _pick_acc_gyr_chars(all_chars)
-        if not acc_uuid or not gyr_uuid:
-            print("[BLE] Could not auto-detect ACC/GYR notify characteristics.")
+        stream_uuid = _pick_stream_char(all_chars)
+        if not stream_uuid:
+            print("[BLE] Could not auto-detect combined BMI stream characteristic.")
             print("[BLE] Notifiable characteristics found:")
             for ch in all_chars:
                 props = ",".join(ch.properties)
@@ -252,36 +246,39 @@ async def ble_worker(sample_q: Queue, stop_evt: threading.Event) -> None:
                     print(f"  - {ch.uuid}  props=[{props}]")
             return
 
-        print(f"[BLE] ACC uuid: {acc_uuid}")
-        print(f"[BLE] GYR uuid: {gyr_uuid}")
+        print(f"[BLE] BMI stream uuid: {stream_uuid}")
 
-        def on_acc(_: int, data: bytearray):
-            if len(data) != 10:
+        def on_stream(_: int, data: bytearray):
+            if len(data) != STREAM_STRUCT.size:
+                return
+            version, seq, ax, ay, az, gx, gy, gz = STREAM_STRUCT.unpack(bytes(data))
+            if version != STREAM_VERSION:
                 return
             now = time.time()
-            seq, ax, ay, az = struct.unpack("<Ihhh", bytes(data))
-            sample_q.put(AccSample(t=now, seq=seq, ax_mg=ax, ay_mg=ay, az_mg=az))
+            sample_q.put(
+                CombinedSample(
+                    t=now,
+                    seq=seq,
+                    ax_mg=ax,
+                    ay_mg=ay,
+                    az_mg=az,
+                    gx_mdps=gx,
+                    gy_mdps=gy,
+                    gz_mdps=gz,
+                )
+            )
 
-        def on_gyr(_: int, data: bytearray):
-            if len(data) != 16:
-                return
-            now = time.time()
-            seq, gx, gy, gz = struct.unpack("<Iiii", bytes(data))
-            sample_q.put(GyrSample(t=now, seq=seq, gx_mdps=gx, gy_mdps=gy, gz_mdps=gz))
-
-        await client.start_notify(acc_uuid, on_acc)
-        await client.start_notify(gyr_uuid, on_gyr)
-        print("[BLE] Notifications started (ACC/GYR).")
+        await client.start_notify(stream_uuid, on_stream)
+        print("[BLE] Combined BMI notifications started.")
 
         try:
             while not stop_evt.is_set():
                 await asyncio.sleep(0.1)
         finally:
-            for u in (acc_uuid, gyr_uuid):
-                try:
-                    await client.stop_notify(u)
-                except Exception:
-                    pass
+            try:
+                await client.stop_notify(stream_uuid)
+            except Exception:
+                pass
             print("[BLE] Notifications stopped.")
 
     finally:
@@ -319,15 +316,12 @@ def main() -> None:
     last_acc = (0.0, 0.0, 0.0)
     last_gyr = (0.0, 0.0, 0.0)
 
-    # drop detection + rate
-    last_acc_seq: Optional[int] = None
-    last_gyr_seq: Optional[int] = None
-    acc_drops = 0
-    gyr_drops = 0
-    acc_count = 0
-    gyr_count = 0
+    # The combined packet has one sequence and one arrival for all six axes.
+    last_seq: Optional[int] = None
+    drops = 0
+    sample_count = 0
     rate_t0 = time.time()
-    last_rates = (0.0, 0.0)
+    last_rate = 0.0
 
     _ = start_ble_thread(sample_q, stop_evt)
 
@@ -371,15 +365,14 @@ def main() -> None:
 
     def drain_queue():
         nonlocal last_acc, last_gyr
-        nonlocal last_acc_seq, last_gyr_seq, acc_drops, gyr_drops
-        nonlocal acc_count, gyr_count
+        nonlocal last_seq, drops, sample_count
         while True:
             try:
                 item = sample_q.get_nowait()
             except Empty:
                 break
 
-            if isinstance(item, AccSample):
+            if isinstance(item, CombinedSample):
                 # unit convert to g
                 if ACC_PAYLOAD_MODE == 'mg':
                     ax_g = item.ax_mg / 1000.0
@@ -390,48 +383,35 @@ def main() -> None:
                     ay_g = (item.ay_mg / 1000.0) / G0
                     az_g = (item.az_mg / 1000.0) / G0
 
-                # drop detection
-                if last_acc_seq is not None:
-                    gap = item.seq - last_acc_seq - 1
+                if last_seq is not None:
+                    gap = item.seq - last_seq - 1
                     if gap > 0:
-                        acc_drops += gap
-                last_acc_seq = item.seq
+                        drops += gap
+                last_seq = item.seq
 
                 # plot uses wall time so it always moves
                 acc_ring.push(item.t, ax_g, ay_g, az_g)
                 last_acc = (ax_g, ay_g, az_g)
-                acc_count += 1
-
-            elif isinstance(item, GyrSample):
                 gx_dps = item.gx_mdps / 1000.0
                 gy_dps = item.gy_mdps / 1000.0
                 gz_dps = item.gz_mdps / 1000.0
-
-                if last_gyr_seq is not None:
-                    gap = item.seq - last_gyr_seq - 1
-                    if gap > 0:
-                        gyr_drops += gap
-                last_gyr_seq = item.seq
-
                 gyr_ring.push(item.t, gx_dps, gy_dps, gz_dps)
                 last_gyr = (gx_dps, gy_dps, gz_dps)
-                gyr_count += 1
+                sample_count += 1
 
     def update(_frame):
-        nonlocal rate_t0, acc_count, gyr_count, last_rates
+        nonlocal rate_t0, sample_count, last_rate
         drain_queue()
         now = time.time()
 
         dt = now - rate_t0
         if dt >= 1.0:
-            acc_hz = acc_count / dt if dt > 0 else 0.0
-            gyr_hz = gyr_count / dt if dt > 0 else 0.0
-            last_rates = (acc_hz, gyr_hz)
+            sample_hz = sample_count / dt if dt > 0 else 0.0
+            last_rate = sample_hz
             rate_t0 = now
-            acc_count = 0
-            gyr_count = 0
+            sample_count = 0
         else:
-            acc_hz, gyr_hz = last_rates
+            sample_hz = last_rate
 
         # accel plot
         t, x, y, z = acc_ring.get_window(now, WINDOW_SEC)
@@ -443,7 +423,7 @@ def main() -> None:
         ax_acc_txt.set_title("acc value")
         acc_text.set_text(f"g   : Ax={ax_g:+.3f}  Ay={ay_g:+.3f}  Az={az_g:+.3f}")
         acc_text2.set_text(f"m/s²: Ax={ax_g*G0:+.3f}  Ay={ay_g*G0:+.3f}  Az={az_g*G0:+.3f}")
-        acc_stats.set_text(f"ACC rate≈{acc_hz:6.1f} Hz  drops={acc_drops}")
+        acc_stats.set_text(f"ACC rate≈{sample_hz:6.1f} Hz  drops={drops}")
 
         # gyro plot
         t2, x2, y2, z2 = gyr_ring.get_window(now, WINDOW_SEC)
@@ -454,7 +434,7 @@ def main() -> None:
         gx, gy, gz = last_gyr
         ax_gyr_txt.set_title("gyr value")
         gyr_text.set_text(f"dps : Gx={gx:+.2f}  Gy={gy:+.2f}  Gz={gz:+.2f}")
-        gyr_stats.set_text(f"GYR rate≈{gyr_hz:6.1f} Hz  drops={gyr_drops}")
+        gyr_stats.set_text(f"GYR rate≈{sample_hz:6.1f} Hz  drops={drops}")
 
         return lax, lay, laz, lgx, lgy, lgz, acc_text, acc_text2, acc_stats, gyr_text, gyr_stats
 

@@ -6,6 +6,8 @@
  * - P1.12 = I2C SDA
  */
 
+#include <zephyr/dt-bindings/i2c/i2c.h>
+
 &pinctrl {
         i2c21_default: i2c21_default {
                 group1 {
@@ -25,6 +27,7 @@
 };
 
 &i2c21 {
+	clock-frequency = <I2C_BITRATE_FAST>;
         pinctrl-0 = <&i2c21_default>;
         pinctrl-1 = <&i2c21_sleep>;
         pinctrl-names = "default", "sleep";
