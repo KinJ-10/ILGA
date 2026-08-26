@@ -29,6 +29,7 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/kernel.h>
 
 #include <zephyr/device.h>
@@ -791,10 +792,29 @@ static struct bt_hrs_cb hrs_cb = {
 #define BMI_DIAG_THREAD_PRIORITY 7
 #define BMI_SAMPLE_PERIOD_MS 10
 #define BMI_DIAG_INTERVAL_MS 5000
+#define BMI_ZERO_ACCEL_LIMIT 10U
+#define BMI_RECOVERY_MAX_ATTEMPTS 2U
+#define BMI_RECOVERY_SETTLE_MS 50U
+#define BMI_ACCEL_RANGE_G 4
+#define BMI_GYRO_RANGE_DPS 1000
 #define BMI270_REG_CHIP_ID 0x00
+#define BMI270_REG_ERROR 0x02
+#define BMI270_REG_STATUS 0x03
+#define BMI270_REG_INTERNAL_STATUS 0x21
 #define BMI270_REG_ACC_CONF 0x40
+#define BMI270_REG_ACC_RANGE 0x41
 #define BMI270_REG_GYR_CONF 0x42
+#define BMI270_REG_GYR_RANGE 0x43
+#define BMI270_REG_PWR_CTRL 0x7D
 #define BMI270_ODR_MASK 0x0F
+#define BMI270_ACC_RANGE_MASK 0x03
+#define BMI270_GYR_RANGE_MASK 0x07
+#define BMI270_EXPECTED_ACC_RANGE_4G 0x01
+#define BMI270_EXPECTED_GYR_RANGE_1000DPS 0x01
+#define BMI270_INTERNAL_STATUS_MASK 0x0F
+#define BMI270_INTERNAL_STATUS_INIT_OK 0x01
+#define BMI270_PWR_CTRL_ACC_GYR_MASK 0x06
+#define BMI270_EXPECTED_CHIP_ID 0x24
 
 #if DT_HAS_COMPAT_STATUS_OKAY(bosch_bmi270)
 #define BMI270_NODE DT_COMPAT_GET_ANY_STATUS_OKAY(bosch_bmi270)
@@ -822,6 +842,9 @@ struct bmi_timing_metrics
 	uint32_t fetch_calls;
 	uint32_t samples;
 	uint32_t fetch_errors;
+	uint32_t invalid_samples;
+	uint32_t recovery_attempts;
+	uint32_t recovery_errors;
 	uint32_t deadline_overruns;
 	uint32_t skipped_periods;
 	uint32_t queue_depth_max;
@@ -854,7 +877,8 @@ static uint32_t timing_average(uint64_t total_us, uint32_t count)
 
 static void bmi_metrics_record_acquisition(uint32_t period_us, bool period_valid,
 					   uint32_t fetch_us, uint32_t process_us,
-					   uint32_t active_us, bool success)
+					   uint32_t active_us, bool fetch_success,
+					   bool data_valid)
 {
 	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
 
@@ -866,7 +890,7 @@ static void bmi_metrics_record_acquisition(uint32_t period_us, bool period_valid
 	}
 	timing_add(&bmi_metrics.fetch_total_us, &bmi_metrics.fetch_max_us, fetch_us);
 	bmi_metrics.fetch_calls++;
-	if (success)
+	if (fetch_success && data_valid)
 	{
 		timing_add(&bmi_metrics.process_total_us, &bmi_metrics.process_max_us,
 			   process_us);
@@ -874,9 +898,26 @@ static void bmi_metrics_record_acquisition(uint32_t period_us, bool period_valid
 			   active_us);
 		bmi_metrics.samples++;
 	}
-	else
+	else if (!fetch_success)
 	{
 		bmi_metrics.fetch_errors++;
+	}
+	else
+	{
+		bmi_metrics.invalid_samples++;
+	}
+
+	k_spin_unlock(&bmi_metrics_lock, key);
+}
+
+static void bmi_metrics_record_recovery(int ret)
+{
+	k_spinlock_key_t key = k_spin_lock(&bmi_metrics_lock);
+
+	bmi_metrics.recovery_attempts++;
+	if (ret != 0)
+	{
+		bmi_metrics.recovery_errors++;
 	}
 
 	k_spin_unlock(&bmi_metrics_lock, key);
@@ -948,26 +989,208 @@ static struct bmi_timing_metrics bmi_metrics_take_snapshot(void)
 }
 
 #if DT_HAS_COMPAT_STATUS_OKAY(bosch_bmi270)
-static void bmi_diag_print_registers(void)
+struct bmi_register_state
 {
 	uint8_t chip_id;
+	uint8_t error;
+	uint8_t status;
+	uint8_t internal_status;
 	uint8_t acc_conf;
+	uint8_t acc_range;
 	uint8_t gyr_conf;
-	int chip_ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_CHIP_ID, &chip_id);
-	int acc_ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_ACC_CONF, &acc_conf);
-	int gyr_ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_GYR_CONF, &gyr_conf);
+	uint8_t gyr_range;
+	uint8_t pwr_ctrl;
+};
 
-	if (chip_ret || acc_ret || gyr_ret)
+static int bmi_read_register_state(struct bmi_register_state *state)
+{
+	int ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_CHIP_ID,
+					   &state->chip_id);
+
+	if (ret == 0)
 	{
-		printk("BMI_DIAG register_read err chip=%d acc=%d gyr=%d\n",
-			   chip_ret, acc_ret, gyr_ret);
-		return;
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_ERROR,
+						   &state->error);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_STATUS,
+						   &state->status);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_INTERNAL_STATUS,
+						   &state->internal_status);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_ACC_CONF,
+						   &state->acc_conf);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_ACC_RANGE,
+						   &state->acc_range);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_GYR_CONF,
+						   &state->gyr_conf);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_GYR_RANGE,
+						   &state->gyr_range);
+	}
+	if (ret == 0)
+	{
+		ret = i2c_reg_read_byte_dt(&bmi_i2c, BMI270_REG_PWR_CTRL,
+						   &state->pwr_ctrl);
 	}
 
-	printk("BMI_DIAG registers chip_id=0x%02x acc_conf=0x%02x acc_odr=0x%x "
+	return ret;
+}
+
+static int bmi_diag_print_registers(const char *reason,
+					struct bmi_register_state *state_out)
+{
+	struct bmi_register_state state;
+	int ret = bmi_read_register_state(&state);
+
+	if (ret != 0)
+	{
+		printk("BMI_DIAG register_read reason=%s err=%d\n", reason, ret);
+		return ret;
+	}
+
+	printk("BMI_DIAG registers reason=%s chip_id=0x%02x err=0x%02x "
+		   "status=0x%02x internal=0x%02x pwr_ctrl=0x%02x "
+		   "acc_range_req_g=%u acc_range=0x%02x acc_range_expected=0x%02x "
+		   "acc_conf=0x%02x acc_odr=0x%x "
+		   "gyr_range_req_dps=%u gyr_range=0x%02x gyr_range_expected=0x%02x "
 		   "gyr_conf=0x%02x gyr_odr=0x%x\n",
-		   chip_id, acc_conf, acc_conf & BMI270_ODR_MASK,
-		   gyr_conf, gyr_conf & BMI270_ODR_MASK);
+		   reason, state.chip_id, state.error, state.status,
+		   state.internal_status, state.pwr_ctrl,
+		   BMI_ACCEL_RANGE_G,
+		   state.acc_range & BMI270_ACC_RANGE_MASK,
+		   BMI270_EXPECTED_ACC_RANGE_4G,
+		   state.acc_conf, state.acc_conf & BMI270_ODR_MASK,
+		   BMI_GYRO_RANGE_DPS,
+		   state.gyr_range & BMI270_GYR_RANGE_MASK,
+		   BMI270_EXPECTED_GYR_RANGE_1000DPS,
+		   state.gyr_conf, state.gyr_conf & BMI270_ODR_MASK);
+
+	if (state_out != NULL)
+	{
+		*state_out = state;
+	}
+
+	return 0;
+}
+
+static int bmi_set_attr_checked(enum sensor_channel channel,
+					enum sensor_attribute attribute,
+					const struct sensor_value *value,
+					const char *label)
+{
+	int ret = sensor_attr_set(bmi, channel, attribute, value);
+
+	printk("BMI config %s ret=%d\n", label, ret);
+	return ret;
+}
+
+static int bmi_configure_sensor(const char *reason)
+{
+	struct sensor_value full_scale = {0};
+	struct sensor_value sampling_freq = {0};
+	struct sensor_value oversampling = {0};
+	int ret;
+
+	printk("BMI configuration start reason=%s\n", reason);
+
+	/* ACC: +/-4G, 100 Hz, normal averaging. */
+	full_scale.val1 = BMI_ACCEL_RANGE_G;
+	oversampling.val1 = 1;
+	sampling_freq.val1 = 100;
+
+	ret = bmi_set_attr_checked(SENSOR_CHAN_ACCEL_XYZ,
+					   SENSOR_ATTR_FULL_SCALE, &full_scale,
+					   "accel FULL_SCALE");
+	if (ret != 0)
+	{
+		return ret;
+	}
+	ret = bmi_set_attr_checked(SENSOR_CHAN_ACCEL_XYZ,
+					   SENSOR_ATTR_OVERSAMPLING, &oversampling,
+					   "accel OVERSAMPLING");
+	if (ret != 0)
+	{
+		return ret;
+	}
+	ret = bmi_set_attr_checked(SENSOR_CHAN_ACCEL_XYZ,
+					   SENSOR_ATTR_SAMPLING_FREQUENCY, &sampling_freq,
+					   "accel SAMPLING_FREQ");
+	if (ret != 0)
+	{
+		return ret;
+	}
+
+	/* GYR: +/-1000 dps, 100 Hz, normal averaging. */
+	full_scale.val1 = BMI_GYRO_RANGE_DPS;
+	ret = bmi_set_attr_checked(SENSOR_CHAN_GYRO_XYZ,
+					   SENSOR_ATTR_FULL_SCALE, &full_scale,
+					   "gyro FULL_SCALE");
+	if (ret != 0)
+	{
+		return ret;
+	}
+	ret = bmi_set_attr_checked(SENSOR_CHAN_GYRO_XYZ,
+					   SENSOR_ATTR_OVERSAMPLING, &oversampling,
+					   "gyro OVERSAMPLING");
+	if (ret != 0)
+	{
+		return ret;
+	}
+	ret = bmi_set_attr_checked(SENSOR_CHAN_GYRO_XYZ,
+					   SENSOR_ATTR_SAMPLING_FREQUENCY, &sampling_freq,
+					   "gyro SAMPLING_FREQ");
+	if (ret != 0)
+	{
+		return ret;
+	}
+
+	return bmi_diag_print_registers(reason, NULL);
+}
+
+static int bmi_recover_zero_data(void)
+{
+	struct bmi_register_state state;
+	int ret = bmi_diag_print_registers("zero_data", &state);
+
+	if (ret != 0)
+	{
+		return ret;
+	}
+	if (state.chip_id != BMI270_EXPECTED_CHIP_ID ||
+	    (state.internal_status & BMI270_INTERNAL_STATUS_MASK) !=
+		    BMI270_INTERNAL_STATUS_INIT_OK)
+	{
+		printk("BMI recovery requires driver reinitialization\n");
+		return -EIO;
+	}
+	if ((state.pwr_ctrl & BMI270_PWR_CTRL_ACC_GYR_MASK) !=
+	    BMI270_PWR_CTRL_ACC_GYR_MASK)
+	{
+		printk("BMI recovery detected disabled sensor power bits\n");
+	}
+
+	ret = bmi_configure_sensor("zero_data_reconfigure");
+	if (ret == 0)
+	{
+		k_sleep(K_MSEC(BMI_RECOVERY_SETTLE_MS));
+	}
+
+	return ret;
 }
 #endif
 
@@ -1113,8 +1336,11 @@ static void bmi_diag_thread(void *p1, void *p2, void *p3)
 			: 0U;
 		uint32_t notify_calls = metrics.notify_ok + metrics.notify_errors;
 
-		printk("BMI_DIAG window_ms=%lld samples=%u rate_millihz=%u fetch_err=%u\n",
-		       elapsed_ms, metrics.samples, rate_millihz, metrics.fetch_errors);
+		printk("BMI_DIAG window_ms=%lld samples=%u rate_millihz=%u fetch_err=%u "
+		       "invalid=%u recovery=%u recovery_err=%u\n",
+		       elapsed_ms, metrics.samples, rate_millihz, metrics.fetch_errors,
+		       metrics.invalid_samples, metrics.recovery_attempts,
+		       metrics.recovery_errors);
 		printk("BMI_DIAG timing_us period_avg=%u period_max=%u fetch_avg=%u "
 		       "fetch_max=%u process_avg=%u process_max=%u active_avg=%u "
 		       "active_max=%u\n",
@@ -1151,11 +1377,9 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 	struct sensor_value acc[3];
 	struct sensor_value gyr[3];
 
-	struct sensor_value full_scale;
-	struct sensor_value sampling_freq;
-	struct sensor_value oversampling;
-
 	uint32_t seq = 0;
+	uint32_t zero_accel_streak = 0;
+	uint32_t recovery_attempts = 0;
 	int ret;
 
 	printk("BMI270 dev ptr = %p, name = %s\n", bmi, bmi->name);
@@ -1167,37 +1391,14 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 	}
 
 	printk("BMI270 is ready\n");
-
-	/* ACC: ±2G, 100Hz */
-	full_scale.val1 = 2;
-	full_scale.val2 = 0;
-	oversampling.val1 = 1;
-	oversampling.val2 = 0;
-	sampling_freq.val1 = 100;
-	sampling_freq.val2 = 0;
-
-	ret = sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_FULL_SCALE, &full_scale);
-	printk("attr accel FULL_SCALE ret=%d\n", ret);
-	ret = sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_OVERSAMPLING, &oversampling);
-	printk("attr accel OVERSAMPLING ret=%d\n", ret);
-	ret = sensor_attr_set(bmi, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &sampling_freq);
-	printk("attr accel SAMPLING_FREQ ret=%d\n", ret);
-
-	/* GYR: ±500 dps, 100Hz */
-	full_scale.val1 = 500;
-	full_scale.val2 = 0;
-	oversampling.val1 = 1;
-	oversampling.val2 = 0;
-	sampling_freq.val1 = 100;
-	sampling_freq.val2 = 0;
-
-	ret = sensor_attr_set(bmi, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_FULL_SCALE, &full_scale);
-	printk("attr gyro FULL_SCALE ret=%d\n", ret);
-	ret = sensor_attr_set(bmi, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_OVERSAMPLING, &oversampling);
-	printk("attr gyro OVERSAMPLING ret=%d\n", ret);
-	ret = sensor_attr_set(bmi, SENSOR_CHAN_GYRO_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &sampling_freq);
-	printk("attr gyro SAMPLING_FREQ ret=%d\n", ret);
-	bmi_diag_print_registers();
+	ret = bmi_configure_sensor("startup");
+	if (ret != 0)
+	{
+		printk("BMI startup configuration failed ret=%d; rebooting\n", ret);
+		k_sleep(K_MSEC(BMI_RECOVERY_SETTLE_MS));
+		sys_reboot(SYS_REBOOT_COLD);
+		return;
+	}
 
 	const int64_t period_ticks = k_ms_to_ticks_ceil64(BMI_SAMPLE_PERIOD_MS);
 	int64_t next_release_ticks = k_uptime_ticks();
@@ -1226,13 +1427,22 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 			printk("sensor_sample_fetch err=%d\n", err);
 			bmi_metrics_record_acquisition(period_us, period_valid, fetch_us,
 						       0U, cycles_since_us(sample_start_cycles),
-						       false);
+						       false, false);
 			goto schedule_next_sample;
 		}
 
 		stage_start_cycles = k_cycle_get_64();
-		sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_XYZ, acc);
-		sensor_channel_get(bmi, SENSOR_CHAN_GYRO_XYZ, gyr);
+		int acc_err = sensor_channel_get(bmi, SENSOR_CHAN_ACCEL_XYZ, acc);
+		int gyr_err = sensor_channel_get(bmi, SENSOR_CHAN_GYRO_XYZ, gyr);
+		if (acc_err != 0 || gyr_err != 0)
+		{
+			printk("sensor_channel_get err acc=%d gyr=%d\n", acc_err, gyr_err);
+			bmi_metrics_record_acquisition(period_us, period_valid, fetch_us,
+						       cycles_since_us(stage_start_cycles),
+						       cycles_since_us(sample_start_cycles),
+						       true, false);
+			goto schedule_next_sample;
+		}
 
 		int32_t ax_mg32 = sensor_ms2_to_mg(&acc[0]);
 		int32_t ay_mg32 = sensor_ms2_to_mg(&acc[1]);
@@ -1241,6 +1451,40 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 		int32_t gx_mdps = sensor_rad_to_10udegrees(&gyr[0]) / 100;
 		int32_t gy_mdps = sensor_rad_to_10udegrees(&gyr[1]) / 100;
 		int32_t gz_mdps = sensor_rad_to_10udegrees(&gyr[2]) / 100;
+
+		if (ax_mg32 == 0 && ay_mg32 == 0 && az_mg32 == 0)
+		{
+			zero_accel_streak++;
+			bmi_metrics_record_acquisition(period_us, period_valid, fetch_us,
+						       cycles_since_us(stage_start_cycles),
+						       cycles_since_us(sample_start_cycles),
+						       true, false);
+
+			if (zero_accel_streak >= BMI_ZERO_ACCEL_LIMIT)
+			{
+				recovery_attempts++;
+				printk("BMI zero acceleration detected count=%u recovery=%u\n",
+				       zero_accel_streak, recovery_attempts);
+				ret = bmi_recover_zero_data();
+				bmi_metrics_record_recovery(ret);
+				zero_accel_streak = 0;
+
+				if (ret != 0 ||
+				    recovery_attempts >= BMI_RECOVERY_MAX_ATTEMPTS)
+				{
+					printk("BMI recovery failed ret=%d attempts=%u; rebooting\n",
+					       ret, recovery_attempts);
+					k_sleep(K_MSEC(BMI_RECOVERY_SETTLE_MS));
+					sys_reboot(SYS_REBOOT_COLD);
+					return;
+				}
+			}
+
+			goto schedule_next_sample;
+		}
+
+		zero_accel_streak = 0;
+		recovery_attempts = 0;
 
 		/* clamp accel to int16 range */
 		if (ax_mg32 > INT16_MAX)
@@ -1278,7 +1522,7 @@ static void bmi_thread(void *p1, void *p2, void *p3)
 		uint32_t active_us = cycles_since_us(sample_start_cycles);
 
 		bmi_metrics_record_acquisition(period_us, period_valid, fetch_us,
-						   process_us, active_us, true);
+						   process_us, active_us, true, true);
 		bmi_ble_enqueue(&sample);
 		seq++;
 

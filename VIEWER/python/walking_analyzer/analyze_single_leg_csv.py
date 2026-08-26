@@ -34,12 +34,14 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 from statistics import mean, median, pstdev
 from typing import Dict, List, Sequence, Tuple
 
 
 REQUIRED_COLUMNS = ("seq", "ax_mg", "ay_mg", "az_mg", "gx_mdps", "gy_mdps", "gz_mdps")
+MAX_ZERO_ACCEL_RATIO = 0.95
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,6 +116,23 @@ def load_samples(path: Path) -> Dict[str, List[float]]:
     return data
 
 
+def validate_sensor_samples(data: Dict[str, List[float]]) -> None:
+    sample_count = len(data["seq"])
+    zero_accel_count = sum(
+        1
+        for ax_mg, ay_mg, az_mg in zip(data["ax_mg"], data["ay_mg"], data["az_mg"])
+        if ax_mg == 0.0 and ay_mg == 0.0 and az_mg == 0.0
+    )
+    zero_accel_ratio = zero_accel_count / sample_count
+
+    if zero_accel_ratio >= MAX_ZERO_ACCEL_RATIO:
+        raise ValueError(
+            "BMI270 acceleration is zero in "
+            f"{zero_accel_count}/{sample_count} samples "
+            f"({zero_accel_ratio:.1%}); refusing to analyze invalid sensor data"
+        )
+
+
 def vector_norm3(x: Sequence[float], y: Sequence[float], z: Sequence[float]) -> List[float]:
     return [math.sqrt(ax * ax + ay * ay + az * az) for ax, ay, az in zip(x, y, z)]
 
@@ -158,7 +177,11 @@ def detect_step_peaks(signal: Sequence[float], fs: float, min_step_sec: float, t
 
     base = median(smoothed)
     p95 = percentile(smoothed, 95.0)
-    threshold = base + threshold_scale * max(0.0, p95 - base)
+    dynamic_range = p95 - base
+    if dynamic_range <= 0.0:
+        return [], base
+
+    threshold = base + threshold_scale * dynamic_range
     min_distance = max(1, int(fs * min_step_sec))
 
     peaks: List[int] = []
@@ -338,9 +361,15 @@ def main() -> int:
     args = parse_args()
     input_path = Path(args.input_csv)
     out_dir = Path(args.out_dir) if args.out_dir else input_path.with_name(f"{input_path.stem}_analysis")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    data = load_samples(input_path)
+    try:
+        data = load_samples(input_path)
+        validate_sensor_samples(data)
+    except (OSError, ValueError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     sample_count = len(data["seq"])
 
     acc_norm_mg = vector_norm3(data["ax_mg"], data["ay_mg"], data["az_mg"])

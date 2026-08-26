@@ -38,6 +38,7 @@ import argparse
 import asyncio
 import csv
 import signal
+import statistics
 import struct
 import sys
 import time
@@ -50,12 +51,36 @@ from typing import Optional
 DEFAULT_NAME = "BMI270_BLE_SAMPLE"
 DEFAULT_SCAN_TIMEOUT = 10.0
 DEFAULT_PROGRESS_INTERVAL_SEC = 1.0
+ZERO_ACCEL_FAULT_LIMIT = 10
 
 STREAM_UUID = "12345678-1234-5678-1234-6789abcdef13"
 STREAM_VERSION = 1
 STREAM_STRUCT = struct.Struct("<BIhhhiii")
 
-CSV_FIELDNAMES = ["seq", "ax_mg", "ay_mg", "az_mg", "gx_mdps", "gy_mdps", "gz_mdps"]
+CSV_FIELDNAMES = [
+    "seq",
+    "rx_monotonic_ns",
+    "rx_elapsed_ns",
+    "ax_mg",
+    "ay_mg",
+    "az_mg",
+    "gx_mdps",
+    "gy_mdps",
+    "gz_mdps",
+]
+
+
+def percentile(values: list[int], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = position - lower_index
+    return ordered[lower_index] + (
+        ordered[upper_index] - ordered[lower_index]
+    ) * fraction
 
 
 def bleak_version() -> str:
@@ -164,6 +189,9 @@ class StreamTracker:
         self.stale_packets = 0
         self.invalid_payloads = 0
         self.invalid_versions = 0
+        self.invalid_sensor_samples = 0
+        self.consecutive_zero_accel = 0
+        self.sensor_fault = False
         self.last_seq: Optional[int] = None
 
     def add_payload(self, data: bytearray) -> Optional[StreamSample]:
@@ -193,6 +221,27 @@ class StreamTracker:
                 )
 
         self.last_seq = sample.seq
+
+        if sample.ax_mg == 0 and sample.ay_mg == 0 and sample.az_mg == 0:
+            self.invalid_sensor_samples += 1
+            self.consecutive_zero_accel += 1
+            if self.consecutive_zero_accel == 1:
+                print(
+                    f"[STREAM] zero acceleration sample at seq={sample.seq}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if self.consecutive_zero_accel >= ZERO_ACCEL_FAULT_LIMIT:
+                self.sensor_fault = True
+                print(
+                    "[STREAM] ERROR: BMI270 acceleration remained zero for "
+                    f"{self.consecutive_zero_accel} samples; stopping capture",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return None
+
+        self.consecutive_zero_accel = 0
         self.completed_samples += 1
         return sample
 
@@ -206,6 +255,9 @@ class ReceiveSession:
         self._capture_start: Optional[float] = None
         self._capture_stop: Optional[float] = None
         self._accepting = False
+        self._first_rx_monotonic_ns: Optional[int] = None
+        self._last_rx_monotonic_ns: Optional[int] = None
+        self._rx_inter_arrival_ns: list[int] = []
         self.ble_disconnects = 0
         self.unexpected_disconnects = 0
 
@@ -225,12 +277,23 @@ class ReceiveSession:
             self.unexpected_disconnects += 1
             self.stop_capture()
 
-    def handle_stream(self, data: bytearray) -> None:
+    def handle_stream(self, data: bytearray, rx_monotonic_ns: int) -> bool:
         if not self._accepting:
-            return
+            return False
         sample = self.tracker.add_payload(data)
         if sample is None:
-            return
+            return self.tracker.sensor_fault
+        if self._first_rx_monotonic_ns is None:
+            self._first_rx_monotonic_ns = rx_monotonic_ns
+            rx_elapsed_ns = 0
+        else:
+            rx_elapsed_ns = rx_monotonic_ns - self._first_rx_monotonic_ns
+        if self._last_rx_monotonic_ns is not None:
+            self._rx_inter_arrival_ns.append(
+                rx_monotonic_ns - self._last_rx_monotonic_ns
+            )
+        self._last_rx_monotonic_ns = rx_monotonic_ns
+
         if self.writer is None:
             print(
                 f"BMI seq={sample.seq} ax_mg={sample.ax_mg} ay_mg={sample.ay_mg} "
@@ -242,6 +305,8 @@ class ReceiveSession:
             self.writer.write_row(
                 {
                     "seq": sample.seq,
+                    "rx_monotonic_ns": rx_monotonic_ns,
+                    "rx_elapsed_ns": rx_elapsed_ns,
                     "ax_mg": sample.ax_mg,
                     "ay_mg": sample.ay_mg,
                     "az_mg": sample.az_mg,
@@ -251,6 +316,7 @@ class ReceiveSession:
                 }
             )
         self._print_progress()
+        return False
 
     def finish(self) -> None:
         self.stop_capture()
@@ -262,17 +328,45 @@ class ReceiveSession:
         if self._capture_start is not None and self._capture_stop is not None:
             elapsed_sec = self._capture_stop - self._capture_start
         effective_hz = self.tracker.completed_samples / elapsed_sec if elapsed_sec > 0 else 0.0
+        inter_arrival_median_ns = (
+            statistics.median(self._rx_inter_arrival_ns)
+            if self._rx_inter_arrival_ns
+            else 0
+        )
+        inter_arrival_p95_ns = percentile(self._rx_inter_arrival_ns, 0.95)
+        inter_arrival_max_ns = max(self._rx_inter_arrival_ns, default=0)
+        timestamp_elapsed_ns = 0
+        if (
+            self._first_rx_monotonic_ns is not None
+            and self._last_rx_monotonic_ns is not None
+        ):
+            timestamp_elapsed_ns = (
+                self._last_rx_monotonic_ns - self._first_rx_monotonic_ns
+            )
+        timestamp_effective_hz = (
+            (self.tracker.completed_samples - 1) * 1_000_000_000
+            / timestamp_elapsed_ns
+            if self.tracker.completed_samples > 1 and timestamp_elapsed_ns > 0
+            else 0.0
+        )
+
         print(
             "[SUMMARY] "
             f"stream_packets={self.tracker.packets} "
             f"completed_samples={self.tracker.completed_samples} "
             f"duration_sec={elapsed_sec:.3f} "
             f"effective_hz={effective_hz:.3f} "
+            f"rx_inter_arrival_median_ns={inter_arrival_median_ns:.0f} "
+            f"rx_inter_arrival_p95_ns={inter_arrival_p95_ns:.0f} "
+            f"rx_inter_arrival_max_ns={inter_arrival_max_ns} "
+            f"rx_timestamp_effective_hz={timestamp_effective_hz:.3f} "
             f"missing_seq={self.tracker.missing_seq_count} "
             f"duplicate_packets={self.tracker.duplicate_packets} "
             f"stale_packets={self.tracker.stale_packets} "
             f"invalid_payloads={self.tracker.invalid_payloads} "
             f"invalid_versions={self.tracker.invalid_versions} "
+            f"invalid_sensor_samples={self.tracker.invalid_sensor_samples} "
+            f"sensor_fault={int(self.tracker.sensor_fault)} "
             f"ble_disconnects={self.ble_disconnects} "
             f"unexpected_disconnects={self.unexpected_disconnects} "
             f"csv='{self.save_csv_path}'",
@@ -292,6 +386,7 @@ class ReceiveSession:
             f"duplicate={self.tracker.duplicate_packets} "
             f"stale={self.tracker.stale_packets} "
             f"invalid={self.tracker.invalid_payloads} "
+            f"invalid_sensor={self.tracker.invalid_sensor_samples} "
             f"last_seq={self.tracker.last_seq if self.tracker.last_seq is not None else -1}",
             flush=True,
         )
@@ -394,7 +489,9 @@ async def run(args: argparse.Namespace) -> int:
         loop.call_soon_threadsafe(stop_event.set)
 
     def on_stream(_: int, data: bytearray) -> None:
-        session.handle_stream(data)
+        rx_monotonic_ns = time.monotonic_ns()
+        if session.handle_stream(data, rx_monotonic_ns):
+            loop.call_soon_threadsafe(stop_event.set)
 
     try:
         client_kwargs = {}
@@ -447,6 +544,10 @@ async def run(args: argparse.Namespace) -> int:
         session.print_summary()
         if duration_reached:
             print("[BLE] capture finished by duration", flush=True)
+
+    if session.tracker.sensor_fault:
+        print("[BLE] capture failed: invalid BMI270 sensor data", file=sys.stderr)
+        return 1
 
     return 0
 
