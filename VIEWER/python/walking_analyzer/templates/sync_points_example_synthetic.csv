@@ -1,0 +1,7 @@
+trial,sync_index,video_frame,video_time_sec,seq,notes,phase
+synthetic_example_walk,1,120,1.000,10100,SYNTHETIC EXAMPLE - not measured data,pre
+synthetic_example_walk,2,240,2.000,10200,SYNTHETIC EXAMPLE - not measured data,pre
+synthetic_example_walk,3,360,3.000,10300,SYNTHETIC EXAMPLE - not measured data,pre
+synthetic_example_walk,4,3000,25.000,12500,SYNTHETIC EXAMPLE - not measured data,post
+synthetic_example_walk,5,3120,26.000,12600,SYNTHETIC EXAMPLE - not measured data,post
+synthetic_example_walk,6,3240,27.000,12700,SYNTHETIC EXAMPLE - not measured data,post

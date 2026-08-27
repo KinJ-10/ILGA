@@ -1,0 +1,9 @@
+trial,event_index,foot,video_frame,video_time_sec,event_type,confidence,notes
+synthetic_example_walk,1,left,720,6.000,normal_contact,high,SYNTHETIC EXAMPLE - not measured data
+synthetic_example_walk,2,right,780,6.500,normal_contact,high,SYNTHETIC EXAMPLE - not measured data
+synthetic_example_walk,3,left,840,7.000,normal_contact,high,SYNTHETIC EXAMPLE - not measured data
+synthetic_example_walk,4,right,900,7.500,normal_contact,medium,SYNTHETIC EXAMPLE - frame chosen at first visible contact
+synthetic_example_walk,5,left,960,8.000,terminal_contact,high,SYNTHETIC EXAMPLE - final intended straight-walk contact
+synthetic_example_walk,6,right,1020,8.500,terminal_contact,high,SYNTHETIC EXAMPLE - final intended straight-walk contact
+synthetic_example_walk,7,right,1080,9.000,adjustment,high,SYNTHETIC EXAMPLE - post-walk foot-position adjustment
+synthetic_example_walk,8,left,1140,9.500,turn,high,SYNTHETIC EXAMPLE - turn movement, excluded from contact GT

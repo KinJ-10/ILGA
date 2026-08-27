@@ -1,0 +1,2 @@
+trial,subject_id,actual_steps,start_foot,end_foot,terminal_condition,video_fps,video_file,sensor_csv,notes
+synthetic_example_walk,SYNTHETIC_SUBJECT,6,left,right,adjustment,120,synthetic_example_walk.mp4,synthetic_example_walk.csv,SYNTHETIC EXAMPLE - not measured data
