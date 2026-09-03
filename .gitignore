@@ -4,6 +4,11 @@ logs/
 # Python generated cache files
 __pycache__/
 *.py[cod]
+
+# Local measurement and generated analysis artifacts
+analysis_out/*
+!analysis_out/README.md
+VIEWER/python/bmi270_BLE_viewer/bmi270_ble_*.csv
 build/
 logs/
 build/
