@@ -41,6 +41,7 @@ import signal
 import statistics
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -56,6 +57,18 @@ ZERO_ACCEL_FAULT_LIMIT = 10
 STREAM_UUID = "12345678-1234-5678-1234-6789abcdef13"
 STREAM_VERSION = 1
 STREAM_STRUCT = struct.Struct("<BIhhhiii")
+
+MARKER_SCHEMA_VERSION = 1
+MARKER_FIELDNAMES = [
+    "schema_version",
+    "trial_name",
+    "event",
+    "event_index",
+    "marker_monotonic_ns",
+    "marker_elapsed_ns",
+    "source",
+    "notes",
+]
 
 CSV_FIELDNAMES = [
     "seq",
@@ -123,6 +136,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--disconnect-on-finish",
         action="store_true",
         help="Explicitly disconnect the BLE client before exit.",
+    )
+    parser.add_argument(
+        "--markers-csv",
+        default=None,
+        help="Enable Windows operator keys (s=START, f=FINISH) and save a separate marker CSV.",
+    )
+    parser.add_argument(
+        "--trial-name",
+        default=None,
+        help="Trial name stored in --markers-csv; required when markers are enabled.",
     )
     return parser
 
@@ -246,9 +269,175 @@ class StreamTracker:
         return sample
 
 
+@dataclass(frozen=True)
+class MarkerStatus:
+    start_count: int
+    finish_count: int
+    marker_valid: bool
+    marked_duration_sec: Optional[float]
+    issues: tuple[str, ...]
+
+
+class OperatorMarkerRecorder:
+    def __init__(self, path: str, trial_name: str):
+        self.path = Path(path)
+        self.trial_name = trial_name
+        self._events: list[dict[str, int | str]] = []
+        self._duplicate_events: set[str] = set()
+        self._lock = threading.Lock()
+        self._written = False
+
+    def record_event(self, event: str, marker_monotonic_ns: Optional[int] = None) -> bool:
+        event = event.upper()
+        if event not in {"START", "FINISH"}:
+            raise ValueError(f"unsupported marker event: {event}")
+        if marker_monotonic_ns is None:
+            marker_monotonic_ns = time.monotonic_ns()
+        with self._lock:
+            if any(item["event"] == event for item in self._events):
+                self._duplicate_events.add(event)
+                print(
+                    f"[MARKER] WARNING: duplicate {event} rejected; original marker preserved",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+            event_index = len(self._events) + 1
+            self._events.append(
+                {
+                    "event": event,
+                    "event_index": event_index,
+                    "marker_monotonic_ns": marker_monotonic_ns,
+                }
+            )
+        print(
+            f"[MARKER] recorded {event} index={event_index} monotonic_ns={marker_monotonic_ns}",
+            flush=True,
+        )
+        return True
+
+    def _snapshot(self) -> tuple[list[dict[str, int | str]], set[str]]:
+        with self._lock:
+            return [dict(item) for item in self._events], set(self._duplicate_events)
+
+    def status(self, first_rx_monotonic_ns: Optional[int]) -> MarkerStatus:
+        events, duplicates = self._snapshot()
+        starts = [item for item in events if item["event"] == "START"]
+        finishes = [item for item in events if item["event"] == "FINISH"]
+        issues: list[str] = []
+        if not starts:
+            issues.append("missing_start")
+        if not finishes:
+            issues.append("missing_finish")
+        if starts and finishes:
+            start_ns = int(starts[0]["marker_monotonic_ns"])
+            finish_ns = int(finishes[0]["marker_monotonic_ns"])
+            if finish_ns <= start_ns:
+                issues.append("finish_not_after_start")
+                marked_duration_sec = None
+            else:
+                marked_duration_sec = (finish_ns - start_ns) / 1_000_000_000
+        else:
+            marked_duration_sec = None
+        if first_rx_monotonic_ns is None:
+            issues.append("missing_rx_reference")
+        elif any(int(item["marker_monotonic_ns"]) < first_rx_monotonic_ns for item in events):
+            issues.append("marker_before_first_rx")
+        for event in sorted(duplicates):
+            issues.append(f"duplicate_{event.lower()}_rejected")
+        if issues:
+            marked_duration_sec = None
+        return MarkerStatus(
+            start_count=len(starts),
+            finish_count=len(finishes),
+            marker_valid=not issues,
+            marked_duration_sec=marked_duration_sec,
+            issues=tuple(issues),
+        )
+
+    def write_csv(self, first_rx_monotonic_ns: Optional[int]) -> None:
+        if self._written:
+            return
+        events, duplicates = self._snapshot()
+        status = self.status(first_rx_monotonic_ns)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("x", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=MARKER_FIELDNAMES)
+            writer.writeheader()
+            for item in events:
+                marker_ns = int(item["marker_monotonic_ns"])
+                notes: list[str] = []
+                event = str(item["event"])
+                if first_rx_monotonic_ns is None:
+                    elapsed_ns: int | str = ""
+                    notes.append("missing_rx_reference")
+                else:
+                    elapsed_ns = marker_ns - first_rx_monotonic_ns
+                if "missing_start" in status.issues:
+                    notes.append("missing_start")
+                if "missing_finish" in status.issues:
+                    notes.append("missing_finish")
+                if "finish_not_after_start" in status.issues:
+                    notes.append("finish_not_after_start")
+                if "marker_before_first_rx" in status.issues:
+                    notes.append("marker_before_first_rx")
+                if event in duplicates:
+                    notes.append(f"duplicate_{event.lower()}_rejected")
+                writer.writerow(
+                    {
+                        "schema_version": MARKER_SCHEMA_VERSION,
+                        "trial_name": self.trial_name,
+                        "event": event,
+                        "event_index": item["event_index"],
+                        "marker_monotonic_ns": marker_ns,
+                        "marker_elapsed_ns": elapsed_ns,
+                        "source": "operator_key",
+                        "notes": ";".join(notes),
+                    }
+                )
+        self._written = True
+
+
+class WindowsMarkerKeyListener:
+    def __init__(self, recorder: OperatorMarkerRecorder):
+        self.recorder = recorder
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("operator marker keys are supported only on Windows consoles")
+        self._thread = threading.Thread(target=self._run, name="operator-marker-keys", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        import msvcrt
+
+        while not self._stop.is_set():
+            if not msvcrt.kbhit():
+                self._stop.wait(0.005)
+                continue
+            key = msvcrt.getwch().lower()
+            marker_monotonic_ns = time.monotonic_ns()
+            if key == "s":
+                self.recorder.record_event("START", marker_monotonic_ns)
+            elif key == "f":
+                self.recorder.record_event("FINISH", marker_monotonic_ns)
+
+
 class ReceiveSession:
-    def __init__(self, save_csv_path: Optional[str]):
+    def __init__(
+        self,
+        save_csv_path: Optional[str],
+        marker_recorder: Optional[OperatorMarkerRecorder] = None,
+    ):
         self.save_csv_path = save_csv_path
+        self.marker_recorder = marker_recorder
         self.writer = CsvSampleWriter(save_csv_path) if save_csv_path else None
         self.tracker = StreamTracker()
         self._last_progress_ts = 0.0
@@ -318,10 +507,16 @@ class ReceiveSession:
         self._print_progress()
         return False
 
+    @property
+    def first_rx_monotonic_ns(self) -> Optional[int]:
+        return self._first_rx_monotonic_ns
+
     def finish(self) -> None:
         self.stop_capture()
         if self.writer is not None:
             self.writer.close()
+        if self.marker_recorder is not None:
+            self.marker_recorder.write_csv(self._first_rx_monotonic_ns)
 
     def print_summary(self) -> None:
         elapsed_sec = 0.0
@@ -350,6 +545,19 @@ class ReceiveSession:
             else 0.0
         )
 
+        marker_status = (
+            self.marker_recorder.status(self._first_rx_monotonic_ns)
+            if self.marker_recorder is not None
+            else None
+        )
+        markers_file = str(self.marker_recorder.path) if self.marker_recorder else "None"
+        marker_valid = str(int(marker_status.marker_valid)) if marker_status else "NA"
+        marked_duration_sec = (
+            f"{marker_status.marked_duration_sec:.6f}"
+            if marker_status and marker_status.marked_duration_sec is not None
+            else "NA"
+        )
+
         print(
             "[SUMMARY] "
             f"stream_packets={self.tracker.packets} "
@@ -369,7 +577,12 @@ class ReceiveSession:
             f"sensor_fault={int(self.tracker.sensor_fault)} "
             f"ble_disconnects={self.ble_disconnects} "
             f"unexpected_disconnects={self.unexpected_disconnects} "
-            f"csv='{self.save_csv_path}'",
+            f"csv='{self.save_csv_path}' "
+            f"markers_file='{markers_file}' "
+            f"start_count={marker_status.start_count if marker_status else 0} "
+            f"finish_count={marker_status.finish_count if marker_status else 0} "
+            f"marker_valid={marker_valid} "
+            f"marked_duration_sec={marked_duration_sec}",
             flush=True,
         )
 
@@ -452,6 +665,17 @@ async def disconnect_quietly(client) -> None:
 
 
 async def run(args: argparse.Namespace) -> int:
+    if args.markers_csv:
+        if not args.trial_name:
+            print("ERROR: --trial-name is required with --markers-csv", file=sys.stderr)
+            return 1
+        if sys.platform != "win32":
+            print("ERROR: --markers-csv operator keys require a Windows console", file=sys.stderr)
+            return 1
+        if Path(args.markers_csv).exists():
+            print(f"ERROR: refusing to overwrite markers CSV: {args.markers_csv}", file=sys.stderr)
+            return 1
+
     try:
         from bleak import BleakClient
         from bleak.exc import BleakError
@@ -469,7 +693,13 @@ async def run(args: argparse.Namespace) -> int:
 
     print(f"[BLE] found name='{device.name}' address='{device.address}'")
 
-    session = ReceiveSession(args.save_csv)
+    marker_recorder = (
+        OperatorMarkerRecorder(args.markers_csv, args.trial_name)
+        if args.markers_csv
+        else None
+    )
+    marker_listener = WindowsMarkerKeyListener(marker_recorder) if marker_recorder else None
+    session = ReceiveSession(args.save_csv, marker_recorder)
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     duration_reached = False
@@ -510,6 +740,10 @@ async def run(args: argparse.Namespace) -> int:
             print(f"[BLE] subscribe BMI stream {STREAM_UUID}")
             await client.start_notify(STREAM_UUID, on_stream)
             session.start_capture()
+            if marker_listener is not None:
+                marker_listener.start()
+                print("[MARKER] enabled: press s=START and f=FINISH once each", flush=True)
+                print(f"[MARKER] saving operator markers to {args.markers_csv}", flush=True)
             if args.save_csv:
                 print(f"[CSV] saving samples to {args.save_csv}")
             print("[BLE] notifications started; press Ctrl+C to stop")
@@ -524,6 +758,8 @@ async def run(args: argparse.Namespace) -> int:
                 pass
             finally:
                 shutdown_expected = True
+                if marker_listener is not None:
+                    marker_listener.stop()
                 session.stop_capture()
                 await stop_notify_quietly(client, STREAM_UUID)
                 print("[BLE] notifications stopped")
@@ -540,6 +776,8 @@ async def run(args: argparse.Namespace) -> int:
         print(f"[BLE] error: {exc!r}", file=sys.stderr)
         return 1
     finally:
+        if marker_listener is not None:
+            marker_listener.stop()
         session.finish()
         session.print_summary()
         if duration_reached:
@@ -548,6 +786,16 @@ async def run(args: argparse.Namespace) -> int:
     if session.tracker.sensor_fault:
         print("[BLE] capture failed: invalid BMI270 sensor data", file=sys.stderr)
         return 1
+
+    if marker_recorder is not None:
+        marker_status = marker_recorder.status(session.first_rx_monotonic_ns)
+        if not marker_status.marker_valid:
+            print(
+                "[MARKER] QUALITY WARNING: invalid operator markers: "
+                + ",".join(marker_status.issues),
+                file=sys.stderr,
+                flush=True,
+            )
 
     return 0
 

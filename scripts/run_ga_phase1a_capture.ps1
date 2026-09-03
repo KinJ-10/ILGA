@@ -4,6 +4,11 @@ param(
     [string]$TrialName,
     [ValidateSet("Walk", "Static")]
     [string]$TrialType = "Walk",
+    [ValidateSet("Right", "Left", "Unknown")]
+    [string]$SensorFoot = "Unknown",
+    [ValidateSet("Walk10m", "Walk", "TUG", "Static")]
+    [string]$TestType,
+    [Nullable[double]]$DistanceM,
     [Nullable[int]]$ActualSteps,
     [string]$EndFoot,
     [ValidateSet("Right", "Left", "None")]
@@ -55,12 +60,17 @@ function Get-IlgaOutputPaths {
         Csv = Join-Path $Directory ($stem + ".csv")
         SummaryLog = Join-Path $Directory ($stem + "_summary.log")
         Metadata = Join-Path $Directory ($stem + "_metadata.json")
+        MarkersCsv = Join-Path $Directory ($stem + "_markers.csv")
     }
 }
 
 function Assert-IlgaOutputsAvailable {
-    param([Parameter(Mandatory)]$Paths)
-    foreach ($path in @($Paths.Csv, $Paths.SummaryLog, $Paths.Metadata)) {
+    param([Parameter(Mandatory)]$Paths, [bool]$IncludeMarkers = $false)
+    $outputs = @($Paths.Csv, $Paths.SummaryLog, $Paths.Metadata)
+    if ($IncludeMarkers) {
+        $outputs += $Paths.MarkersCsv
+    }
+    foreach ($path in $outputs) {
         if (Test-Path -LiteralPath $path) {
             throw "Refusing to overwrite existing output: $path"
         }
@@ -128,6 +138,21 @@ function ConvertTo-IlgaActualSteps {
     return $parsed
 }
 
+function ConvertTo-IlgaOptionalActualSteps {
+    param([AllowNull()]$Value)
+    $text = if ($null -eq $Value) { "" } else { [string]$Value.Trim() }
+    if ([string]::IsNullOrWhiteSpace($text) -or $text.ToLowerInvariant() -in @("unknown", "none")) {
+        return [pscustomobject]@{
+            Value = $null
+            Source = "post_capture_unknown"
+        }
+    }
+    return [pscustomobject]@{
+        Value = ConvertTo-IlgaActualSteps -Value $text
+        Source = "post_capture_prompt"
+    }
+}
+
 function ConvertTo-IlgaFoot {
     param([AllowNull()]$Value, [string]$Name = "Foot")
     if ($null -eq $Value) {
@@ -141,19 +166,112 @@ function ConvertTo-IlgaFoot {
     }
 }
 
+function ConvertTo-IlgaOptionalEndFoot {
+    param([AllowNull()]$Value)
+    $text = if ($null -eq $Value) { "" } else { [string]$Value.Trim() }
+    if ([string]::IsNullOrWhiteSpace($text) -or $text.ToLowerInvariant() -in @("unknown", "none")) {
+        return [pscustomobject]@{
+            Value = $null
+            Source = "post_capture_unknown"
+        }
+    }
+    return [pscustomobject]@{
+        Value = ConvertTo-IlgaFoot -Value $text -Name "EndFoot"
+        Source = "post_capture_prompt"
+    }
+}
+
 function Read-IlgaActualSteps {
     while ($true) {
-        $value = Read-Host "Enter ActualSteps (integer >= 0)"
-        try { return ConvertTo-IlgaActualSteps -Value $value }
+        $value = Read-Host "Enter ActualSteps (integer >= 0, or blank/Unknown)"
+        try { return ConvertTo-IlgaOptionalActualSteps -Value $value }
         catch { Write-Warning $_.Exception.Message }
     }
 }
 
 function Read-IlgaEndFoot {
     while ($true) {
-        $value = Read-Host "Enter EndFoot (Right/Left/None)"
-        try { return ConvertTo-IlgaFoot -Value $value -Name "EndFoot" }
+        $value = Read-Host "Enter EndFoot (Right/Left, or blank/None/Unknown)"
+        try { return ConvertTo-IlgaOptionalEndFoot -Value $value }
         catch { Write-Warning $_.Exception.Message }
+    }
+}
+
+function ConvertTo-IlgaDistanceM {
+    param([AllowNull()]$Value)
+    $parsed = 0.0
+    if ($null -eq $Value -or
+        -not [double]::TryParse(
+            [string]$Value,
+            [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed
+        ) -or
+        $parsed -le 0) {
+        throw "DistanceM must be a number greater than zero."
+    }
+    return $parsed
+}
+
+function Resolve-IlgaTestDefinition {
+    param(
+        [Parameter(Mandatory)][ValidateSet("Walk", "Static")][string]$TrialTypeValue,
+        [AllowNull()]$TestTypeValue,
+        [AllowNull()]$DistanceMValue
+    )
+
+    if ($TrialTypeValue -eq "Static") {
+        if (-not [string]::IsNullOrWhiteSpace([string]$TestTypeValue) -and $TestTypeValue -ne "Static") {
+            throw "Static TrialType requires TestType=Static or omission."
+        }
+        if ($null -ne $DistanceMValue -and [double]$DistanceMValue -ne 0.0) {
+            throw "Static trials require DistanceM=0 or omission."
+        }
+        return [pscustomobject]@{
+            TestType = "Static"
+            DistanceM = 0.0
+            MarkersEnabled = $false
+            ProtocolMode = "static"
+            MeasurementEvent = "static_stillness_for_duration"
+            SequenceEvent = "static_stillness_for_duration"
+        }
+    }
+
+    $resolvedType = if ([string]::IsNullOrWhiteSpace([string]$TestTypeValue)) { "Walk10m" } else { [string]$TestTypeValue }
+    if ($resolvedType -eq "Static") {
+        throw "Walk TrialType cannot use TestType=Static."
+    }
+    if ($resolvedType -eq "Walk10m") {
+        $distance = if ($null -eq $DistanceMValue) { 10.0 } else { ConvertTo-IlgaDistanceM -Value $DistanceMValue }
+        if ($distance -ne 10.0) {
+            throw "TestType=Walk10m requires DistanceM=10 or omission; use TestType=Walk for another distance."
+        }
+        $mode = "walk"
+        $event = "marked_10m_walk"
+        $sequenceEvent = "walk_10m"
+    }
+    elseif ($resolvedType -eq "Walk") {
+        $distance = ConvertTo-IlgaDistanceM -Value $DistanceMValue
+        $mode = "walk"
+        $event = "marked_walk_distance"
+        $sequenceEvent = "walk_distance"
+    }
+    elseif ($resolvedType -eq "TUG") {
+        $distance = if ($null -eq $DistanceMValue) { $null } else { ConvertTo-IlgaDistanceM -Value $DistanceMValue }
+        $mode = "tug"
+        $event = "marked_tug_total"
+        $sequenceEvent = "tug"
+    }
+    else {
+        throw "Unsupported TestType: $resolvedType"
+    }
+    return [pscustomobject]@{
+        TestType = $resolvedType
+        DistanceM = $distance
+        MarkersEnabled = $true
+        ProtocolMode = $mode
+        MeasurementEvent = $event
+        SequenceEvent = $sequenceEvent
     }
 }
 
@@ -201,20 +319,22 @@ function Resolve-IlgaTrialInputs {
     $resolvedStartFoot = ConvertTo-IlgaFoot -Value $StartFootValue -Name "StartFoot"
     $actualPending = $null -eq $ActualStepsValue
     $endPending = [string]::IsNullOrWhiteSpace([string]$EndFootValue)
+    $resolvedEndFoot = if ($endPending) { $null } else { ConvertTo-IlgaFoot -Value $EndFootValue -Name "EndFoot" }
+    $endUnknown = -not $endPending -and $resolvedEndFoot -eq "None"
     return [pscustomobject]@{
         ActualSteps = if ($actualPending) { $null } else { ConvertTo-IlgaActualSteps -Value $ActualStepsValue }
         StartFoot = $resolvedStartFoot
-        EndFoot = if ($endPending) { $null } else { ConvertTo-IlgaFoot -Value $EndFootValue -Name "EndFoot" }
+        EndFoot = if ($endPending -or $endUnknown) { $null } else { $resolvedEndFoot }
         EndCondition = [string]$EndConditionValue
         ActualStepsInputPending = $actualPending
         EndFootInputPending = $endPending
         ActualStepsSource = if ($actualPending) { "post_capture_prompt" } else { "command_line" }
-        EndFootSource = if ($endPending) { "post_capture_prompt" } else { "command_line" }
+        EndFootSource = if ($endPending) { "post_capture_prompt" } elseif ($endUnknown) { "command_line_unknown" } else { "command_line" }
     }
 }
 
 function Invoke-IlgaSelfTest {
-    $sample = "[SUMMARY] received=2994 missing_seq=7 invalid_sensor_samples=0 sensor_fault=0 rx_timestamp_effective_hz=99.800 csv='C:\data files\trial.csv'"
+    $sample = "[SUMMARY] received=2994 missing_seq=7 invalid_sensor_samples=0 sensor_fault=0 rx_timestamp_effective_hz=99.800 csv='C:\data files\trial.csv' markers_file='C:\data files\trial_markers.csv' start_count=1 finish_count=1 marker_valid=1 marked_duration_sec=5.250000"
     $summaryLine = Get-IlgaSummaryLine -Lines @(
         "[SCAN] device discovery started",
         "[PROGRESS] received=1000",
@@ -228,7 +348,12 @@ function Invoke-IlgaSelfTest {
         $parsed.invalid_sensor_samples -ne "0" -or
         $parsed.sensor_fault -ne "0" -or
         $parsed.rx_timestamp_effective_hz -ne "99.800" -or
-        $parsed.csv -ne "C:\data files\trial.csv"
+        $parsed.csv -ne "C:\data files\trial.csv" -or
+        $parsed.markers_file -ne "C:\data files\trial_markers.csv" -or
+        $parsed.start_count -ne "1" -or
+        $parsed.finish_count -ne "1" -or
+        $parsed.marker_valid -ne "1" -or
+        $parsed.marked_duration_sec -ne "5.250000"
     ) {
         throw "Summary extraction self-test failed."
     }
@@ -267,6 +392,61 @@ function Invoke-IlgaSelfTest {
     ) {
         throw "Post-capture input normalization self-test failed."
     }
+    $knownSteps = ConvertTo-IlgaOptionalActualSteps -Value "16"
+    $unknownStepsBlank = ConvertTo-IlgaOptionalActualSteps -Value ""
+    $unknownStepsText = ConvertTo-IlgaOptionalActualSteps -Value "Unknown"
+    $knownEndFoot = ConvertTo-IlgaOptionalEndFoot -Value "left"
+    $unknownEndFootNone = ConvertTo-IlgaOptionalEndFoot -Value "None"
+    $unknownEndFootBlank = ConvertTo-IlgaOptionalEndFoot -Value ""
+    if (
+        $knownSteps.Value -ne 16 -or
+        $knownSteps.Source -ne "post_capture_prompt" -or
+        $null -ne $unknownStepsBlank.Value -or
+        $unknownStepsBlank.Source -ne "post_capture_unknown" -or
+        $null -ne $unknownStepsText.Value -or
+        $knownEndFoot.Value -ne "Left" -or
+        $knownEndFoot.Source -ne "post_capture_prompt" -or
+        $null -ne $unknownEndFootNone.Value -or
+        $unknownEndFootNone.Source -ne "post_capture_unknown" -or
+        $null -ne $unknownEndFootBlank.Value
+    ) {
+        throw "Optional post-capture input self-test failed."
+    }
+    $unknownMetadata = [ordered]@{
+        sensor_foot = "Unknown"
+        sensor_foot_source = "default_unknown"
+        actual_steps = $unknownStepsText.Value
+        actual_steps_source = $unknownStepsText.Source
+        end_foot = $unknownEndFootNone.Value
+        end_foot_source = $unknownEndFootNone.Source
+        post_capture_input_pending = [ordered]@{ actual_steps = $false; end_foot = $false }
+    }
+    $unknownRoundTrip = $unknownMetadata | ConvertTo-Json -Depth 3 | ConvertFrom-Json
+    $knownMetadata = [ordered]@{
+        sensor_foot = "Left"
+        sensor_foot_source = "command_line"
+        actual_steps = $knownSteps.Value
+        actual_steps_source = $knownSteps.Source
+        end_foot = $knownEndFoot.Value
+        end_foot_source = $knownEndFoot.Source
+        post_capture_input_pending = [ordered]@{ actual_steps = $false; end_foot = $false }
+    }
+    $knownRoundTrip = $knownMetadata | ConvertTo-Json -Depth 3 | ConvertFrom-Json
+    if (
+        $null -ne $unknownRoundTrip.actual_steps -or
+        $unknownRoundTrip.sensor_foot -ne "Unknown" -or
+        $unknownRoundTrip.sensor_foot_source -ne "default_unknown" -or
+        $unknownRoundTrip.actual_steps_source -ne "post_capture_unknown" -or
+        $null -ne $unknownRoundTrip.end_foot -or
+        $unknownRoundTrip.end_foot_source -ne "post_capture_unknown" -or
+        $unknownRoundTrip.post_capture_input_pending.actual_steps -or
+        $unknownRoundTrip.post_capture_input_pending.end_foot -or
+        $knownRoundTrip.actual_steps -ne 16 -or
+        $knownRoundTrip.sensor_foot -ne "Left" -or
+        $knownRoundTrip.end_foot -ne "Left"
+    ) {
+        throw "Known/unknown metadata JSON self-test failed."
+    }
     foreach ($invalidSteps in @("", "-1", "1.5", "abc")) {
         $rejected = $false
         try { ConvertTo-IlgaActualSteps -Value $invalidSteps | Out-Null }
@@ -280,9 +460,37 @@ function Invoke-IlgaSelfTest {
         if (-not $rejected) { throw "EndFoot rejection self-test failed for '$invalidFoot'." }
     }
 
+    $walk10mDefinition = Resolve-IlgaTestDefinition -TrialTypeValue Walk -TestTypeValue $null -DistanceMValue $null
+    $walkDistanceDefinition = Resolve-IlgaTestDefinition -TrialTypeValue Walk -TestTypeValue Walk -DistanceMValue 4
+    $tugDefinition = Resolve-IlgaTestDefinition -TrialTypeValue Walk -TestTypeValue TUG -DistanceMValue $null
+    $staticDefinition = Resolve-IlgaTestDefinition -TrialTypeValue Static -TestTypeValue $null -DistanceMValue $null
+    $invalidWalk10mRejected = $false
+    try { Resolve-IlgaTestDefinition -TrialTypeValue Walk -TestTypeValue Walk10m -DistanceMValue 4 | Out-Null }
+    catch { $invalidWalk10mRejected = $true }
+    if (
+        $walk10mDefinition.DistanceM -ne 10 -or
+        $walkDistanceDefinition.DistanceM -ne 4 -or
+        $null -ne $tugDefinition.DistanceM -or
+        -not $tugDefinition.MarkersEnabled -or
+        $staticDefinition.DistanceM -ne 0 -or
+        $staticDefinition.MarkersEnabled -or
+        -not $invalidWalk10mRejected
+    ) {
+        throw "TestType/DistanceM self-test failed."
+    }
+
     $walkTrial = Resolve-IlgaTrialInputs -Type Walk -ActualStepsValue $null -StartFootValue Right -EndFootValue $null -EndConditionValue "stop after line"
     if (-not $walkTrial.ActualStepsInputPending -or -not $walkTrial.EndFootInputPending -or $walkTrial.StartFoot -ne "Right") {
         throw "Walk trial pending-input self-test failed."
+    }
+    $walkUnknownEnd = Resolve-IlgaTrialInputs -Type Walk -ActualStepsValue 16 -StartFootValue Right -EndFootValue None -EndConditionValue "stop after line"
+    if (
+        $walkUnknownEnd.ActualSteps -ne 16 -or
+        $null -ne $walkUnknownEnd.EndFoot -or
+        $walkUnknownEnd.EndFootInputPending -or
+        $walkUnknownEnd.EndFootSource -ne "command_line_unknown"
+    ) {
+        throw "Walk command-line unknown EndFoot self-test failed."
     }
     $staticTrial = Resolve-IlgaTrialInputs -Type Static -ActualStepsValue $null -StartFootValue $null -EndFootValue $null -EndConditionValue "stop30s"
     if (
@@ -327,13 +535,25 @@ function Invoke-IlgaSelfTest {
         if (-not $collisionRejected) {
             throw "Overwrite refusal self-test failed."
         }
+        Remove-Item -LiteralPath $paths.Csv -Force
+        [IO.File]::WriteAllText($paths.MarkersCsv, "test")
+        $markerCollisionRejected = $false
+        try {
+            Assert-IlgaOutputsAvailable -Paths $paths -IncludeMarkers $true
+        }
+        catch {
+            $markerCollisionRejected = $_.Exception.Message -eq "Refusing to overwrite existing output: $($paths.MarkersCsv)"
+        }
+        if (-not $markerCollisionRejected) {
+            throw "Markers CSV overwrite refusal self-test failed."
+        }
     }
     finally {
         if ($testDirectory.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $testDirectory -Recurse -Force
         }
     }
-    Write-Host "SELFTEST PASS: summary extraction, quality warning detection, ActualSteps/EndFoot validation, Walk/Static validation, and overwrite refusal"
+    Write-Host "SELFTEST PASS: summary extraction, quality warning detection, SensorFoot and known/unknown ActualSteps/EndFoot validation, Walk/Static/TestType validation, and CSV/log/metadata/markers overwrite refusal"
 }
 
 if ($SelfTest) {
@@ -347,6 +567,10 @@ if ([string]::IsNullOrWhiteSpace($TrialName)) {
 if ($TrialName -notmatch "^[A-Za-z0-9][A-Za-z0-9_-]*$") {
     throw "TrialName may contain only letters, digits, underscore and hyphen."
 }
+$testDefinition = Resolve-IlgaTestDefinition -TrialTypeValue $TrialType -TestTypeValue $TestType -DistanceMValue $DistanceM
+$TestType = $testDefinition.TestType
+$DistanceM = $testDefinition.DistanceM
+$markersEnabled = $testDefinition.MarkersEnabled
 $resolvedInputs = Resolve-IlgaTrialInputs -Type $TrialType -ActualStepsValue $ActualSteps -StartFootValue $StartFoot -EndFootValue $EndFoot -EndConditionValue $EndCondition
 $ActualSteps = $resolvedInputs.ActualSteps
 $StartFoot = $resolvedInputs.StartFoot
@@ -365,7 +589,7 @@ if (-not (Test-Path -LiteralPath $viewerPath -PathType Leaf)) {
 
 $dateStamp = Get-Date -Format "yyyyMMdd"
 $paths = Get-IlgaOutputPaths -Directory $OutputDirectory -Name $TrialName -DateStamp $dateStamp
-Assert-IlgaOutputsAvailable -Paths $paths
+Assert-IlgaOutputsAvailable -Paths $paths -IncludeMarkers $markersEnabled
 
 $viewerArguments = @(
     "-3.12",
@@ -376,6 +600,12 @@ $viewerArguments = @(
     "--duration-sec", $DurationSec,
     "--disconnect-on-finish"
 )
+if ($markersEnabled) {
+    $viewerArguments += @(
+        "--markers-csv", $paths.MarkersCsv,
+        "--trial-name", $TrialName
+    )
+}
 
 $protocol = if ($TrialType -eq "Static") {
     [ordered]@{
@@ -395,20 +625,22 @@ $protocol = if ($TrialType -eq "Static") {
 }
 else {
     [ordered]@{
-        mode = "walk"
+        mode = $testDefinition.ProtocolMode
+        test_type = $TestType
+        measurement_interval = $testDefinition.MeasurementEvent
         synchronization = [ordered]@{
             pre = [ordered]@{ action = "stomp"; count = 3; timing = "before pre-walk stillness" }
             post = [ordered]@{ action = "stomp"; count = 3; timing = "after terminal stillness, before capture stop" }
             total_count = 6
         }
-        pre_walk_stillness = "Stand still before the 10 m walk as directed by the protocol."
-        walk_distance_m = 10
+        pre_walk_stillness = "Stand still before the marked interval as directed by the protocol."
+        walk_distance_m = $DistanceM
         terminal_condition = $EndCondition
         post_terminal_stillness_sec = [ordered]@{ minimum = 3; maximum = 5 }
         sequence = @(
             "pre_sync_3_stomps",
             "pre_walk_stillness",
-            "walk_10m",
+            $testDefinition.SequenceEvent,
             "terminal_condition",
             "post_terminal_stillness_3_to_5_sec",
             "post_sync_3_stomps",
@@ -420,11 +652,15 @@ else {
 $metadataBase = [ordered]@{
     schema_version = 1
     trial_type = $TrialType
+    test_type = $TestType
+    distance_m = $DistanceM
     trial_name = $TrialName
+    sensor_foot = $SensorFoot
+    sensor_foot_source = if ($PSBoundParameters.ContainsKey("SensorFoot")) { "command_line" } else { "default_unknown" }
     actual_steps = if ($actualStepsInputPending) { $null } else { [int]$ActualSteps }
     actual_steps_source = $resolvedInputs.ActualStepsSource
     start_foot = $StartFoot
-    end_foot = if ($endFootInputPending) { $null } else { $EndFoot }
+    end_foot = if ($endFootInputPending) { $null } else { $resolvedInputs.EndFoot }
     end_foot_source = $resolvedInputs.EndFootSource
     end_condition = $EndCondition
     post_capture_input_pending = [ordered]@{
@@ -436,6 +672,8 @@ $metadataBase = [ordered]@{
     capture_duration_sec = $DurationSec
     csv_path = $paths.Csv
     summary_log_path = $paths.SummaryLog
+    markers_path = if ($markersEnabled) { $paths.MarkersCsv } else { $null }
+    markers_required = $markersEnabled
     analyzer_automatic = $false
 }
 
@@ -445,13 +683,29 @@ if ($DryRun) {
         Write-Host "Protocol: complete stillness for $DurationSec sec -> capture stop (no synchronization stomps, no walk, no terminal action)."
     }
     else {
-        Write-Host "Protocol: pre sync stomps x3 -> stillness -> 10 m walk -> terminal condition -> stillness 3-5 sec -> post sync stomps x3 -> capture stop (6 sync stomps total)."
+        $measurementLabel = switch ($TestType) {
+            "Walk10m" { "marked 10 m walk" }
+            "Walk" { "marked $DistanceM m walk" }
+            "TUG" { "marked TUG interval" }
+        }
+        Write-Host "Protocol: pre sync stomps x3 -> stillness -> $measurementLabel -> terminal condition -> stillness 3-5 sec -> post sync stomps x3 -> capture stop (6 sync stomps total)."
+        Write-Host "Operator markers: press s at START and f at FINISH during the marked interval."
     }
     Write-Host ("ActualSteps: " + $(if ($actualStepsInputPending) { "post-capture input planned" } else { "specified: $ActualSteps" }))
-    Write-Host ("EndFoot: " + $(if ($endFootInputPending) { "post-capture input planned" } else { "specified: $EndFoot" }))
+    Write-Host "SensorFoot: $SensorFoot"
+    Write-Host ("EndFoot: " + $(
+        if ($endFootInputPending) { "post-capture input planned" }
+        elseif ($null -eq $resolvedInputs.EndFoot) { "specified unknown" }
+        else { "specified: $($resolvedInputs.EndFoot)" }
+    ))
+    Write-Host ("Markers CSV: " + $(if ($markersEnabled) { $paths.MarkersCsv } else { "disabled" }))
     Write-Host ("Command: py " + ($viewerArguments -join " "))
     Write-Host ("Planned metadata: " + (($metadataBase | ConvertTo-Json -Depth 6) -replace "\r?\n", " "))
     return
+}
+
+if ($TrialType -eq "Walk" -and $SensorFoot -eq "Unknown") {
+    Write-Warning "SensorFoot is Unknown. Attachment-foot reference step conversion will be disabled during analysis."
 }
 
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
@@ -476,13 +730,17 @@ if ($summaryLine) {
 
 if ($viewerExitCode -eq 0 -and $null -ne $summary) {
     if ($actualStepsInputPending) {
-        $ActualSteps = Read-IlgaActualSteps
-        $metadataBase["actual_steps"] = [int]$ActualSteps
+        $actualStepsResult = Read-IlgaActualSteps
+        $ActualSteps = $actualStepsResult.Value
+        $metadataBase["actual_steps"] = if ($null -eq $ActualSteps) { $null } else { [int]$ActualSteps }
+        $metadataBase["actual_steps_source"] = $actualStepsResult.Source
         $metadataBase["post_capture_input_pending"]["actual_steps"] = $false
     }
     if ($endFootInputPending) {
-        $EndFoot = Read-IlgaEndFoot
-        $metadataBase["end_foot"] = $EndFoot
+        $endFootResult = Read-IlgaEndFoot
+        $EndFoot = $endFootResult.Value
+        $metadataBase["end_foot"] = $endFootResult.Value
+        $metadataBase["end_foot_source"] = $endFootResult.Source
         $metadataBase["post_capture_input_pending"]["end_foot"] = $false
     }
 }
@@ -500,8 +758,24 @@ $metadata.metrics = [ordered]@{
     invalid_sensor_samples = ConvertTo-NullableNumber -Summary $summary -Name "invalid_sensor_samples" -Type "int"
     sensor_fault = ConvertTo-NullableNumber -Summary $summary -Name "sensor_fault" -Type "int"
     rx_timestamp_effective_hz = ConvertTo-NullableNumber -Summary $summary -Name "rx_timestamp_effective_hz" -Type "double"
+    markers_file = if ($null -ne $summary -and $null -ne $summary.PSObject.Properties["markers_file"]) { $summary.markers_file } else { $null }
+    start_count = ConvertTo-NullableNumber -Summary $summary -Name "start_count" -Type "int"
+    finish_count = ConvertTo-NullableNumber -Summary $summary -Name "finish_count" -Type "int"
+    marker_valid = if (
+        $null -ne $summary -and
+        $null -ne $summary.PSObject.Properties["marker_valid"] -and
+        $summary.marker_valid -ne "NA"
+    ) { ConvertTo-NullableNumber -Summary $summary -Name "marker_valid" -Type "int" } else { $null }
+    marked_duration_sec = if (
+        $null -ne $summary -and
+        $null -ne $summary.PSObject.Properties["marked_duration_sec"] -and
+        $summary.marked_duration_sec -ne "NA"
+    ) { ConvertTo-NullableNumber -Summary $summary -Name "marked_duration_sec" -Type "double" } else { $null }
 }
 $qualityWarnings = @(Get-IlgaQualityWarnings -Metrics $metadata.metrics)
+if ($markersEnabled -and $metadata.metrics.marker_valid -ne 1) {
+    $qualityWarnings += "marker_valid=$($metadata.metrics.marker_valid)"
+}
 $metadata.quality_warning = ($qualityWarnings.Count -gt 0)
 $metadata.quality_warning_reasons = $qualityWarnings
 $metadata | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $paths.Metadata -Encoding utf8NoBOM
@@ -512,16 +786,25 @@ Write-Host ("  missing_seq: {0}" -f (Format-IlgaMetricValue $metadata.metrics.mi
 Write-Host ("  invalid_sensor_samples: {0}" -f (Format-IlgaMetricValue $metadata.metrics.invalid_sensor_samples))
 Write-Host ("  sensor_fault: {0}" -f (Format-IlgaMetricValue $metadata.metrics.sensor_fault))
 Write-Host ("  rx_timestamp_effective_hz: {0}" -f (Format-IlgaMetricValue $metadata.metrics.rx_timestamp_effective_hz))
+if ($markersEnabled) {
+    Write-Host ("  start_count: {0}" -f (Format-IlgaMetricValue $metadata.metrics.start_count))
+    Write-Host ("  finish_count: {0}" -f (Format-IlgaMetricValue $metadata.metrics.finish_count))
+    Write-Host ("  marker_valid: {0}" -f (Format-IlgaMetricValue $metadata.metrics.marker_valid))
+    Write-Host ("  marked_duration_sec: {0}" -f (Format-IlgaMetricValue $metadata.metrics.marked_duration_sec))
+}
 foreach ($warning in $qualityWarnings) {
     Write-Warning "CAPTURE QUALITY WARNING: $warning. Raw CSV was preserved: $($paths.Csv)"
 }
 
 if ($viewerExitCode -ne 0) {
-    Write-Host "ERROR: Viewer CLI failed with exit code $viewerExitCode. CSV, metadata, and log were preserved." -ForegroundColor Red
+    Write-Host "ERROR: Viewer CLI failed with exit code $viewerExitCode. Sensor CSV, marker CSV (if created), metadata, and log were preserved." -ForegroundColor Red
     exit $viewerExitCode
 }
 if ($null -eq $summary) {
     throw "Viewer CLI completed without a [SUMMARY] record. Metadata and log were preserved."
 }
 Write-Host "Capture complete: $($paths.Csv)"
+if ($markersEnabled) {
+    Write-Host "Markers: $($paths.MarkersCsv)"
+}
 Write-Host "Metadata: $($paths.Metadata)"

@@ -1,5 +1,9 @@
 build/
 logs/
+
+# Python generated cache files
+__pycache__/
+*.py[cod]
 build/
 logs/
 build/
