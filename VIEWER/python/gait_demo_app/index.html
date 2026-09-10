@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>ILGA | 10m歩行デモ</title><link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header><span class="brand">ILGA <small>VIEWER / v0.1</small></span><span class="tag">ローカル測定</span></header>
+<main>
+<h1>歩行テスト・解析デモ</h1>
+<p class="lead">※右足の甲付近に設置すること</p>
+<section class="panel">
+<h2>1. 測定条件</h2>
+<div class="fields">
+<label>測定名<input id="trial" value="10m歩行" maxlength="80"></label>
+<label>取得時間（秒）<input id="duration" type="number" value="30" min="10" max="120"></label>
+</div>
+<button id="start" class="primary">取得開始</button>
+</section>
+<section class="panel">
+<h2>2. 歩行データ取得</h2>
+<div class="status"><b id="state">待機中</b><span id="counts"></span></div>
+<progress id="progress" max="30" value="0"></progress>
+<p id="detail" role="status" aria-live="polite">接続を確認しています。</p>
+<div class="buttons"><button id="markStart" disabled>START・開始線</button><button id="markFinish" disabled>FINISH・終了線</button><button id="stop" disabled>停止して解析</button></div>
+<ol>
+<li>受信開始後、足踏みを3回してから静止します。</li>
+<li>10mの開始線を越えるときにSTART、終了線を越えるときにFINISHを押します。</li>
+<li>3〜5秒静止し、足踏みを3回します。設定時間で自動終了・解析します。手動停止もできます。</li>
+</ol>
+<p class="muted">足踏みが不足しても継続し、警告します。START/FINISHは操作者が押した時刻です。</p>
+</section>
+<section class="panel">
+<h2>3. 歩行状態の入力 <small>任意</small></h2>
+<p>受信中・解析完了後に入力して保存できます。未確認の値は空欄にしてください。</p>
+<div class="fields">
+<label>実測歩数<input id="actual" type="number" min="1" max="200" placeholder="未入力"></label>
+<label>開始足<select id="startFoot"><option value="unknown">不明</option><option value="right">右足</option><option value="left">左足</option></select></label>
+<label>終了足<select id="endFoot"><option value="unknown">不明</option><option value="right">右足</option><option value="left">左足</option></select></label>
+<label>開始前の足踏み回数<input id="pre" type="number" min="0" max="20" placeholder="未確認"></label>
+<label>終了後の足踏み回数<input id="post" type="number" min="0" max="20" placeholder="未確認"></label>
+</div>
+<p class="muted">足踏み回数は自己申告です。アプリが自動検出した値ではありません。</p>
+<button id="save" disabled>観察値を保存・結果を更新</button>
+</section>
+<p id="error" class="error" role="alert" hidden></p>
+<section class="panel" id="result" hidden>
+<h2>4. 結果</h2><a id="report" class="result-link" target="_blank" rel="noopener">結果レポートを開く →</a>
+<p>結果を測定ごとのフォルダーに保存しました。</p>
+<p>保存先：<span id="savePath" class="save-path"></span></p>
+<button id="openFolder" disabled>保存フォルダーを開く</button>
+<p id="folderMessage" role="status" aria-live="polite"></p>
+</section>
+<aside><h2>注意</h2>
+<p>全歩を直接検出しているわけではなく、右足イベントから総歩数を参考換算しています。</p>
+<p>検出点は解剖学的な厳密な接地時刻ではありません。</p>
+<p>平均歩幅は10m÷歩数です。個々の歩幅は推定しません。</p></aside>
+<p class="muted">対象外：TUG、複数装着プロファイル、足裏など別装着向けの自動判定。</p>
+</main>
+</body></html>
