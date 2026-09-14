@@ -1,0 +1,11 @@
+mainmenu "ILGA CS Reflector"
+
+source "Kconfig.zephyr"
+
+config IL_CS_RAW_DIAGNOSTICS
+	bool "Send ILGA Channel Sounding raw diagnostic metadata"
+	default n
+	help
+	  Precede each fixed-size step-data transfer with procedure metadata for
+	  the matching diagnostic initiator build. Do not mix normal and
+	  diagnostic role builds.

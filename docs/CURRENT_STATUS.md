@@ -1,6 +1,6 @@
 # ILGA 現在状態
 
-更新日: 2026-08-07
+更新日: 2026-09-14
 
 ## 基準
 
@@ -46,7 +46,16 @@
 
 - Phase1はCS主体、単一LOCATOR、約1秒周期の検知エリア侵入・離脱通知を成立条件とする。
 - AoA統合と1 m級の連続位置表示はPhase1の成立条件に含めない。
-- 現リポジトリのLOCATORはREADMEのみで、実装は未着手。
+- IL-Phase 0として、nRF54L15 DK 2台用のLOCATOR/InitiatorとTAG/ReflectorをNCS v3.2.3 `connected_cs`基準で追加した。
+- Phase 0の両アプリは`build/il_cs_initiator`と`build/il_cs_reflector`でbuild成功済み。2026-09-11にnRF54L15 DK 2台へflashし、BLE接続、CS設定、約0.99秒周期の反復距離出力を確認した。
+- 先頭10秒を除く評価で、0.5 m正対・見通しの60秒×3試行はPBR中央値2.393 m、事象率2.65%、接続断0だった。同一机上のおおよそ1 m・60秒×3試行はPBR中央値2.255 m、事象率3.40%、接続断0で、距離順序が逆転した。
+- 約1 m測定後に0.5 mへ戻すA-B-A試験では、戻りAのPBR中央値が2.372 mとなり、初回Aとの差は-0.021 mだった。配置変更に反応する可能性はあるが、反応方向が逆で分布も重なるため、現条件での0.5 m／約1 m距離識別は未成立。現ケーブルでは1 m超の試験が難しく、次回は給電・配置方法と生データ取得を見直す。
+- Initiator側USBがWSLから外れた際、Initiatorだけの再接続ではCS距離出力が復旧せず、両DKの同時リセットで復旧した。自動再接続は未実装。
+- ILCS2 raw診断版は230400 baud、32 channels、6 ms pacingで120秒smokeを通過し、reset後124 proceduresでchecksum、連番、parse、firmware、512 byte overflowの各エラー0件を確認した。
+- 2026-09-14の旧机raw A-B-Aは0.5 mが5.194 / 0.412 m、1.0 mが4.003 mで再現性と距離順序が成立しなかった。机変更後のA-B-Aは0.5 mが1.712 / 1.699 m、1.0 mが2.337 mとなり、環境変更後に改善した。
+- 新しい机で0.50 / 0.75 / 1.00 mを各60秒×3試行した結果、PBR合算中央値は1.389 / 1.929 / 2.220 mで単調増加し、457/458 proceduresが有効だった。固定配置の相対距離識別と試行間再現性は合格、絶対距離精度は不合格、補正と再設置再現性は未成立・未評価とする。
+- 近距離サンプルベース技術検証は条件付き合格。IL Phase 0全体は遠距離、遮蔽、向き、動的、境界、復帰試験が未実施のため継続する。成果は`analysis_out/il_cs_raw/20260914_env2_distance_series_summary/`に保存した。
+- 実機試験手順と合否基準は`docs/il/IL_PHASE0_CHANNEL_SOUNDING.md`を参照する。
 
 ## 開発環境
 
@@ -77,7 +86,8 @@
 5. `step_events.csv` へのイベント時X/Y/Z加速度・角速度の追加は未実装。diagnostic plotへの表示のみ完了。
 6. TAG `main.c` のdeprecated macro warning 1件は未対応。
 7. GA-Phase1Bの5 m / 10 m試験、歩行速度出力、GA-Phase1CのTUG総時間は未実装。
-8. IL-Phase1のCS測距、ゾーン判定、LOCATOR、Viewerエリア設定は未実装。
+8. IL-Phase 0は近距離0.50～1.00 mの固定配置・相対距離評価まで条件付き合格。1 m超の静止距離、再設置、遮蔽、向き、動的、境界、復帰試験は未実施。
+9. IL-Phase1のゾーン判定、LOCATOR統合、Viewerエリア設定は未実装。
 
 ## 次の実装順
 

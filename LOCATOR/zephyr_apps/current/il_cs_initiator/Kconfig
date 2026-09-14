@@ -1,0 +1,39 @@
+mainmenu "ILGA CS Initiator"
+
+source "Kconfig.zephyr"
+
+config IL_CS_RAW_DIAGNOSTICS
+	bool "Emit ILGA Channel Sounding raw diagnostic records"
+	default n
+	help
+	  Emit checksummed ILCS2 CSV records for host-side inspection. This mode also
+	  enables procedure metadata exchange with the matching diagnostic
+	  reflector build. Do not mix normal and diagnostic role builds.
+
+config IL_CS_RAW_EVERY_N
+	int "Emit every Nth CS procedure"
+	default 1
+	range 1 255
+	depends on IL_CS_RAW_DIAGNOSTICS
+	help
+	  Increase this value if UART output affects the CS cadence.
+
+config IL_CS_RAW_RECORD_PACING_MS
+	int "Delay between ILCS2 UART records in milliseconds"
+	default 6
+	range 0 10
+	depends on IL_CS_RAW_DIAGNOSTICS
+	help
+	  Yield between complete checksummed records so the SEGGER VCOM and host
+	  serial path can drain a procedure burst. Six milliseconds preserves
+	  margin for a typical record at 230400 baud. Zero disables pacing.
+
+config IL_CS_RAW_CHANNEL_COUNT
+	int "Number of CS channels enabled for raw diagnostics"
+	default 32
+	range 15 36
+	depends on IL_CS_RAW_DIAGNOSTICS
+	help
+	  Limit raw diagnostic procedures to the 32 channels intended by the
+	  upstream connected CS sample so the single 512-byte GATT transfer is
+	  not exceeded. Normal builds retain their existing channel map.
