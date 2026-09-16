@@ -114,7 +114,9 @@ def parse_raw_log(path: Path) -> tuple[dict[int, dict[str, Any]], list[dict[str,
             if not markers:
                 continue
             marker = min(markers)
-            host_timestamp = line[:marker].rstrip("\t ")
+            host_prefix = line[:marker].rstrip("\t ")
+            prefix_contaminated = "\t" in host_prefix
+            host_timestamp = host_prefix.split("\t", 1)[0]
             wire_line = line[marker:]
             wire_fields = next(csv.reader([wire_line]))
             schema = wire_fields[0] if wire_fields else "UNKNOWN"
@@ -185,6 +187,20 @@ def parse_raw_log(path: Path) -> tuple[dict[int, dict[str, Any]], list[dict[str,
                     previous_record_sequence = record_sequence
 
                 procedure = _get_procedure(procedures, boot_index, procedure_counter)
+
+                if prefix_contaminated:
+                    _parse_error(
+                        parse_errors,
+                        procedures,
+                        boot_index=boot_index,
+                        line_number=line_number,
+                        host_timestamp=host_timestamp,
+                        schema=schema,
+                        record_sequence=record_sequence,
+                        procedure_counter=procedure_counter,
+                        line=line,
+                        reason="NON_RAW_PREFIX_BEFORE_RECORD",
+                    )
 
                 if record_type == "H" and len(fields) == 17:
                     side = fields[3]

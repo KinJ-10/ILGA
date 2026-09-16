@@ -289,6 +289,29 @@ TAGをモバイルバッテリー給電、LOCATORをPC給電とし、磁力の�
 docs/il/results/20260916_open_space_static/
 ```
 
+### 6.7 2026-09-16 UART record pacing比較
+
+距離評価で散発したUART record破損をRF条件から分離するため、TAG / Reflectorは同じraw診断ファームのままモバイルバッテリー給電し、LOCATOR / Initiatorだけを6 / 8 / 10 ms pacingへ切り替えた。各条件を120秒×2試行取得し、capture開始・終了で途中から入ったprocedureを評価対象外とした。
+
+| pacing | 試行 | 完結procedure | 中間区間のparse / framing error | firmware error | 周期中央値 | 判定 |
+|---:|---:|---:|---:|---:|---:|---|
+| 6 ms | 1 | 121 | 1 | 0 | 0.990秒 | status行とILCS2行の結合1件 |
+| 6 ms | 2 | 120 | 0 | 0 | 0.992秒 | 合格 |
+| 8 ms | 1 | 121 | 0 | 0 | 0.990秒 | 合格 |
+| 8 ms | 2 | 120 | 0 | 0 | 0.996秒 | 合格 |
+| 10 ms | 1 | 118 | 6 | 7 | 1.005秒 | 不合格 |
+| 10 ms | 2 | 120 | 14 | 15 | 0.988秒 | 不合格 |
+
+6 ms試行1ではchecksumとrecord sequenceは連続していたが、通常の距離表示行の末尾へ次のchecksummed ILCS2 headerが改行なしで結合した。旧parserは行中の`ILCS2,`から後だけを受理するためこの異常を0件と数えていた。host timestampとILCS2の間に非raw文字列がある場合を`NON_RAW_PREFIX_BEFORE_RECORD`として記録し、checksummed record自体は解析へ残すよう修正する。
+
+10 msではchecksummed recordのfield値がAPI値域を外れるsemantic errorと、firmwareの`UNSUPPORTED_MODE`が両試行で再現した。待機時間がprocedure処理へ干渉した可能性があり採用しない。8 msは2試行とも中間区間の破損0件で周期も約0.99秒を維持したため、raw診断の既定値を8 msとする。
+
+正式結果は次に保存する。
+
+```text
+docs/il/results/20260916_uart_pacing/
+```
+
 ## 7. 測定共通条件
 
 - 屋内の見通し直線を床へマーキングし、アンテナ間距離を測る。
@@ -426,7 +449,7 @@ build/il_cs_initiator_raw/merged.hex
 build/il_cs_reflector_raw/merged.hex
 ```
 
-raw診断はInitiatorの`CONFIG_IL_CS_RAW_DIAGNOSTICS=y`とReflectorの同設定を組にして使う。診断buildと通常buildを混在させない。`CONFIG_IL_CS_RAW_EVERY_N=1`は全procedureを出す。`CONFIG_IL_CS_RAW_RECORD_PACING_MS=6`は完全なILCS2 recordごとにmain threadをyieldし、`CONFIG_PRINTK_SYNC=y`はstatus用の1回の`printk()`が他contextの出力と混在しないようserializeする。ILCS2 record自体はchecksumまで完成バッファ化し、chosen console UARTへmutex下で直接poll送信する。`CONFIG_IL_CS_RAW_CHANNEL_COUNT=32`はraw時だけCS channel mapを32 channelsへ制限する。
+raw診断はInitiatorの`CONFIG_IL_CS_RAW_DIAGNOSTICS=y`とReflectorの同設定を組にして使う。診断buildと通常buildを混在させない。`CONFIG_IL_CS_RAW_EVERY_N=1`は全procedureを出す。`CONFIG_IL_CS_RAW_RECORD_PACING_MS=8`は完全なILCS2 recordごとにmain threadをyieldし、`CONFIG_PRINTK_SYNC=y`はstatus用の1回の`printk()`が他contextの出力と混在しないようserializeする。ILCS2 record自体はchecksumまで完成バッファ化し、chosen console UARTへmutex下で直接poll送信する。`CONFIG_IL_CS_RAW_CHANNEL_COUNT=32`はraw時だけCS channel mapを32 channelsへ制限する。
 
 診断モードではReflectorが512 byteのstep data writeに先立ち、同じGATT characteristicへ短いmetadata writeを送る。metadataにはprotocol magic/version、procedure counter、実step長、valid/overflow/no-data、CS result headerを含む。Initiatorは次を確認してから距離計算とraw出力を行う。
 
@@ -484,9 +507,9 @@ controller/APIが提供しない環境補正値、multipath分類、真距離、
 
 2026-09-11の次の125秒smokeでは、raw firmwareとhostを230400 baudへ揃え、両capture開始後に両DKをresetした。Initiatorログ890,129 byte、Reflectorログ1,047 byteで、Reflectorの起動、接続、MTU 247、CS config/security/procedure開始を確認できた。しかし旧parserではparse error 59件、boot-aware再解析でも全体58件、reset後区間55件だった。`CHECKSUM_FIELD_INVALID`、`CHECKSUM_MISMATCH`、`RECORD_SEQUENCE_GAP`、field fragment混在が多数あり、baudを2倍にするだけでは解消しなかった。Reflectorではstep data 519、519、528 byteの3件が512-byte上限を超え、procedure 57、90がlocal/peer invalidになった。従ってこの結果もformal試験には使用しない。
 
-Zephyr v4.2.99のUART consoleは`printk()`を1 byteずつ`uart_poll_out()`へ渡すpoll方式であり、非同期software ringのoverflowではない。一方、`CONFIG_PRINTK_SYNC`が無効だとpreempting interrupt等の出力が1 record内へinterleaveでき、`uart_poll_out()`の完了はSEGGER VCOMからhost applicationまでのdrain完了を保証しない。rawだけ`CONFIG_PRINTK_SYNC=y`をstatus出力へ使用し、ILCS2は完成行をchosen UARTへ直接poll送信する。record間pacingは6 msとする。
+Zephyr v4.2.99のUART consoleは`printk()`を1 byteずつ`uart_poll_out()`へ渡すpoll方式であり、非同期software ringのoverflowではない。一方、`CONFIG_PRINTK_SYNC`が無効だとpreempting interrupt等の出力が1 record内へinterleaveでき、`uart_poll_out()`の完了はSEGGER VCOMからhost applicationまでのdrain完了を保証しない。rawだけ`CONFIG_PRINTK_SYNC=y`をstatus出力へ使用し、ILCS2は完成行をchosen UARTへ直接poll送信する。record間pacingは8 msとする。
 
-230400 baudの8-N-1 payload上限は約23.0 kbyte/sである。既知の約5.0 kbyte/procedureはwire上約217 msで、1 procedureを最大100 recordsと保守的に見積もった6 ms pacingを加えても約817 msである。公称0.99秒procedure周期内に収まり、record間にVCOM/host drain時間を与える。
+230400 baudの8-N-1 payload上限は約23.0 kbyte/sである。既知の約5.0 kbyte/procedureはwire上約217 msである。実測では8 ms pacingでもprocedure周期中央値0.990～0.996秒を維持した。一方、10 msではsemantic errorとfirmware errorが再現したため、10 msは使用しない。
 
 NCS v3.2.3標準connected CS sampleは、512-byte単一GATT writeへ収める方法として`channel_map_repetition=1`と限定channel mapを採用し、コメントでは32 consecutive channelsとしている。ただし実装loopの`26 <= channel < 62`は36 channelsである。raw時だけ同じ公開API方式で32 channelsへ修正し、通常構成の36 channelsは維持する。Bluetooth CS APIは最低15 channelsを要求するため32は有効範囲内である。GATT/ATTの512-byte上限自体は変更しない。
 
@@ -568,7 +591,7 @@ fixtureはテスト専用であり、既存A-B-Aログを変換または上書�
 wait
 ```
 
-230400 baud＋direct UART poll＋6 ms pacing＋32 channels変更後は最初に同じ向き・高さ・見通しのまま2分smokeを行う。両captureを開始してから両DKをresetし、Reflector側にも起動・接続ログを残す。Initiator起動行の`ILCS2 raw diagnostics: 32 channels, 6 ms record pacing, direct UART`も確認する。解析ではreset後の`boot_index`だけをgate対象にする。次をすべて満たした場合だけ、0.5 mを60秒、約1 mを60秒、0.5 mへ戻して60秒のformal A-B-Aへ進む。
+230400 baud＋direct UART poll＋8 ms pacing＋32 channels変更後は最初に同じ向き・高さ・見通しのまま2分smokeを行う。両captureを開始してから両DKをresetし、Reflector側にも起動・接続ログを残す。Initiator起動行の`ILCS2 raw diagnostics: 32 channels, 8 ms record pacing, direct UART`も確認する。解析ではreset後の`boot_index`だけをgate対象にする。次をすべて満たした場合だけ、0.5 mを60秒、約1 mを60秒、0.5 mへ戻して60秒のformal A-B-Aへ進む。
 
 1. Initiator/Reflectorログがともに非0 byteで、各roleの起動・接続状態を確認できる。
 2. `ILCS2`の`H`と`Z`が同じprocedure counterで対になり、欠落procedureがない。

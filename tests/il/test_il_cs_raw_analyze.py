@@ -125,6 +125,25 @@ class IlCsRawAnalyzeTests(unittest.TestCase):
         self.assertEqual(parse_errors, [])
         self.assertTrue(procedures[3]["ended"])
 
+    def test_status_prefix_joined_to_valid_record_is_reported_but_record_is_kept(self) -> None:
+        record = ilcs2_record(30, "H,4,L,0,100,0,-40,0,0,0,0,1,1,255,12,1")
+        capture = (
+            "2026-09-16T12:12:34.388+09:00\t"
+            "- Phase-Based Ranging method: 8.0 meters "
+            + record
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "joined.log"
+            path.write_text(capture)
+            procedures, parse_errors = parse_raw_log(path)
+
+        self.assertEqual(len(parse_errors), 1)
+        self.assertEqual(parse_errors[0]["reason"], "NON_RAW_PREFIX_BEFORE_RECORD")
+        self.assertEqual(
+            procedures[4]["headers"]["L"]["host_timestamp"],
+            "2026-09-16T12:12:34.388+09:00",
+        )
+
     def test_ilcs2_sequence_zero_starts_new_boot_without_gap(self) -> None:
         capture = "".join(
             [

@@ -58,6 +58,9 @@
 - 2026-09-16にTAGをモバイルバッテリー給電とした見通し環境で0.5 / 1.0 / 2.0 / 3.0 mを各60秒×3試行した。採用12試行のPBRは609/612 procedures（99.5%）が有効で、firmware errorは0件だった。
 - 基本PBR中央値は0.383 / 7.991 / 6.441 / 6.662 mとなり、真距離とのSpearman順位相関は0.40で基準0.90を満たさなかった。別方式の円周位相探索、外れchannel除去、0.5 m基準のchannel補正でも改善せず、0.5～3.0 m距離順序と絶対距離精度は不合格、ゾーン判定への移行は保留とした。
 - 採用外の2.0 m 2試行と3.0 m 1試行でUART record破損を確認した。距離推定と分離し、raw pacing等のsmoke試験を行う。正式結果は`docs/il/results/20260916_open_space_static/`へ保存する。
+- 同じTAG BLE条件で6 / 8 / 10 ms pacingを各120秒×2試行比較した。6 msは2試行中1試行でstatus行とILCS2行の結合1件、8 msは2試行とも中間区間の破損0件、10 msはsemantic parse error 6 / 14件とfirmware error 7 / 15件が再現した。raw診断の既定値は8 msとする。
+- 8 ms復帰後の最終実機確認では、取得開始時の途中1件を除く45 proceduresがすべてlocal / peer header付きで完結し、parse / framing error 0件、firmware error 0件だった。BLE / CS再接続とraw取得の復帰を確認した。
+- parserがchecksummed ILCS2の前へ結合した非raw文字列を見逃していたため、`NON_RAW_PREFIX_BEFORE_RECORD`として記録しつつrecord自体は保持するよう修正する。成果は`docs/il/results/20260916_uart_pacing/`へ保存する。
 - 実機試験手順と合否基準は`docs/il/IL_PHASE0_CHANNEL_SOUNDING.md`を参照する。
 
 ## 開発環境
