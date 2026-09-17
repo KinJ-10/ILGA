@@ -61,6 +61,7 @@
 - 同じTAG BLE条件で6 / 8 / 10 ms pacingを各120秒×2試行比較した。6 msは2試行中1試行でstatus行とILCS2行の結合1件、8 msは2試行とも中間区間の破損0件、10 msはsemantic parse error 6 / 14件とfirmware error 7 / 15件が再現した。raw診断の既定値は8 msとする。
 - 8 ms復帰後の最終実機確認では、取得開始時の途中1件を除く45 proceduresがすべてlocal / peer header付きで完結し、parse / framing error 0件、firmware error 0件だった。BLE / CS再接続とraw取得の復帰を確認した。
 - parserがchecksummed ILCS2の前へ結合した非raw文字列を見逃していたため、`NON_RAW_PREFIX_BEFORE_RECORD`として記録しつつrecord自体は保持するよう修正する。成果は`docs/il/results/20260916_uart_pacing/`へ保存する。
+- 次の距離推定比較として、NCS v3.2.3公式Nordic RAS + `cs_de`のInitiator / Reflectorを現行ILと独立したbuildディレクトリで構築した。2026-09-17にLOCATOR / TAGの両DKへ書き込み、45秒の実機smokeで449件のIFFT・位相傾き・RTTを連続取得し、fatal error・再起動なしを確認した。動作確認は合格。設置距離を記録していないため絶対距離精度は未評価で、次は0.5 m・120秒の真値付き試験を行う。
 - 実機試験手順と合否基準は`docs/il/IL_PHASE0_CHANNEL_SOUNDING.md`を参照する。
 
 ## 開発環境
