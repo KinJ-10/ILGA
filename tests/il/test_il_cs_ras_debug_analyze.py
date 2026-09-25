@@ -21,6 +21,7 @@ from il_cs_ras_debug_analyze import (  # noqa: E402
     robust_phase_slope,
 )
 from il_cs_ras_debug_profile import frame_profile, local_maxima  # noqa: E402
+from il_cs_ras_debug_compare import endpoint_calibration  # noqa: E402
 
 
 def synthetic_frame(distance_m: float = 1.0) -> dict:
@@ -85,6 +86,10 @@ class RasDebugAnalyzeTests(unittest.TestCase):
         self.assertAlmostEqual(strongest * C_M_PER_S / (2 * 512 * 1_000_000), 1.0, delta=0.3)
         self.assertIn(strongest, local_maxima(profile[:50]))
         self.assertAlmostEqual(selected * C_M_PER_S / (2 * 512 * 1_000_000), 1.0, delta=0.4)
+
+    def test_endpoint_calibration_holds_out_middle_distance(self) -> None:
+        gain, offset = endpoint_calibration(1.5, 0.5, 5.0, 1.5)
+        self.assertAlmostEqual(gain * 3.25 + offset, 1.0)
 
 
 if __name__ == "__main__":

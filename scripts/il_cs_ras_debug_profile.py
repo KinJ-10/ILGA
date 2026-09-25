@@ -74,12 +74,14 @@ def main(argv: list[str] | None = None) -> int:
     profiles = []
     official_bins = []
     early_bins = []
+    dominant_bins = []
     frame_summaries = []
     for frame in frames:
         profile, official_bin = frame_profile(frame)
         full_profiles.append(profile)
         profiles.append(profile[:max_bin])
         official_bins.append(official_bin)
+        dominant_bins.append(int(np.argmax(profile[:NFFT // 2])))
         summary, _, _ = analyze_frame(frame)
         frame_summaries.append(summary)
         early_bins.append(summary["early_peak"])
@@ -105,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
                 "local_maximum": index in local_maxima(profile),
                 "official_selected": index == official_bins[capture_index],
                 "early_selected": index == early_bins[capture_index],
+                "dominant_selected": index == dominant_bins[capture_index],
             })
 
     aggregate_rows = []
@@ -120,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             "aggregate_local_maximum": index in aggregate_peaks,
             "official_selected_count": official_bins.count(index),
             "early_selected_count": early_bins.count(index),
+            "dominant_selected_count": dominant_bins.count(index),
         })
 
     true_bin = args.true_distance_m / BIN_M
@@ -137,7 +141,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         median_correlation = math.nan
 
-    dominant_distances = np.asarray([row["early_peak_m"] for row in frame_summaries], dtype=float)
+    dominant_distances = np.asarray([
+        _distance_for_peak(full_profiles[index], dominant_bins[index])
+        for index in range(len(frames))
+    ], dtype=float)
+    early_distances = np.asarray([row["early_peak_m"] for row in frame_summaries], dtype=float)
     robust_distances = np.asarray([row["robust_phase_slope_m"] for row in frame_summaries], dtype=float)
     cross_method_valid = np.isfinite(dominant_distances) & np.isfinite(robust_distances)
     if np.count_nonzero(cross_method_valid) > 1:
@@ -148,6 +156,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         cross_method_correlation = math.nan
         cross_method_median_difference = math.nan
+    early_method_valid = np.isfinite(early_distances) & np.isfinite(robust_distances)
+    early_method_correlation = (float(np.corrcoef(
+        early_distances[early_method_valid], robust_distances[early_method_valid])[0, 1])
+        if np.count_nonzero(early_method_valid) > 1 else math.nan)
 
     candidate_rows = []
     for relative in (0.02, 0.05, 0.10, 0.15, 0.25):
@@ -206,10 +218,13 @@ def main(argv: list[str] | None = None) -> int:
         "approximate_ifft_range_resolution_m": C_M_PER_S / (2 * CHANNELS * 1_000_000),
         "dominant_ifft_vs_robust_phase_correlation": cross_method_correlation,
         "dominant_ifft_minus_robust_phase_median_m": cross_method_median_difference,
+        "early_ifft_vs_robust_phase_correlation": early_method_correlation,
         "official_selected_bins": {str(index): official_bins.count(index)
                                    for index in sorted(set(official_bins))},
         "early_selected_bins": {str(index): early_bins.count(index)
                                 for index in sorted(set(early_bins))},
+        "dominant_selected_bins": {str(index): dominant_bins.count(index)
+                                   for index in sorted(set(dominant_bins))},
         "dominant_aggregate_peaks": [
             {"bin": index, "nominal_distance_m": index * BIN_M,
              "median_relative_strength": float(median[index]),
@@ -222,6 +237,19 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(args.output_dir / "ifft_profiles.csv", profile_rows)
     write_csv(args.output_dir / "ifft_profile_summary.csv", aggregate_rows)
     write_csv(args.output_dir / "candidate_sweep.csv", candidate_rows)
+    write_csv(args.output_dir / "frame_metrics.csv", [
+        {
+            "capture_index": index,
+            "official_bin": official_bins[index],
+            "official_ifft_m": frame_summaries[index]["nordic_ifft_recalc_m"],
+            "dominant_bin": dominant_bins[index],
+            "dominant_ifft_m": dominant_distances[index],
+            "early_bin": early_bins[index],
+            "early_ifft_m": early_distances[index],
+            "robust_phase_m": robust_distances[index],
+        }
+        for index in range(len(frames))
+    ])
     (args.output_dir / "profile_metrics.json").write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
@@ -271,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
         axes[1].axvline(args.true_distance_m, color="white", linestyle="--", linewidth=1.5)
         axes[1].scatter(np.asarray(official_bins) * BIN_M, np.arange(len(frames)),
                         marker="x", color="#ffb000", s=28, label="official selection")
+        axes[1].scatter(np.asarray(dominant_bins) * BIN_M, np.arange(len(frames)),
+                        marker="+", color="#e63946", s=24, label="dominant peak")
         axes[1].set(xlabel="Nominal IFFT distance (m)", ylabel="Capture index",
                     title="Per-frame normalized IFFT profile")
         axes[1].legend(loc="upper right")
