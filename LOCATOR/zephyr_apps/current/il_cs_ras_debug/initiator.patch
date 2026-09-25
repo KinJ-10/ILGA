@@ -1,0 +1,33 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -65,3 +65,4 @@
+ static struct bt_conn_le_cs_config cs_config;
++#include "il_ras_diag.h"
+ 
+ static void store_distance_estimates(cs_de_report_t *p_report)
+@@ -184,4 +185,5 @@
+ 	static cs_de_report_t cs_de_report;
+ 
++	IL_RAS_DIAG_COLLECT(&latest_local_steps, &latest_peer_steps, &cs_config);
+ 	cs_de_populate_report(&latest_local_steps, &latest_peer_steps, &cs_config, &cs_de_report);
+ 
+@@ -196,3 +198,4 @@
+ 	cs_de_quality_t quality = cs_de_calc(&cs_de_report);
++	IL_RAS_DIAG_ENQUEUE(ranging_counter, &cs_de_report, quality);
+ 
+ 	if (quality == CS_DE_QUALITY_OK) {
+@@ -592,3 +595,6 @@
+	LOG_INF("Starting Channel Sounding Initiator Sample");
++	printk("ILRAS1,H,MAIN,%u\\n", k_uptime_get_32());
++	IL_RAS_DIAG_INIT();
++	printk("ILRAS1,H,DIAG_READY,%u\\n", k_uptime_get_32());
+ 
+	dk_leds_init();
+@@ -614,3 +618,6 @@
+-	k_sem_take(&sem_connected, K_FOREVER);
++	while (k_sem_take(&sem_connected, K_SECONDS(5)) != 0) {
++		printk("ILRAS1,H,SCAN,%u\n", k_uptime_get_32());
++	}
++	printk("ILRAS1,H,CONNECTED,%u\n", k_uptime_get_32());
+ 
+ 	err = bt_conn_set_security(connection, BT_SECURITY_L2);

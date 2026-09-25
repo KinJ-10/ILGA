@@ -95,3 +95,54 @@ LOCATORログから449件の距離推定を解析でき、IFFT・位相傾き・
 | RTT | 449 | 4.640 | 4.611 | 0.197 |
 
 以上から、初回smokeの合格条件を満たした。今回の設置距離は試験条件として記録していないため、表示値の絶対距離精度は評価対象外とする。次は同じ高さ・向き・見通し条件で0.5 mを120秒取得し、真値付き比較を開始する。
+
+## 9. 1 m固定のアルゴリズム検証（2026-09-25着手）
+
+既存の0.5 m / 1.0 mの最終推定ログは比較基準として保存する。IQを含まないため、アルゴリズムの再計算には使えない。追加の実測は1.0 m固定で、最初に生データを1回取得する。
+
+診断版は公式RAS Initiatorの作業コピーへ小さなパッチを当てて別buildにする。TAG / Reflectorは公式RAS版を継続使用する。既存の`il_cs_ras_build.sh`、公式build、GA/currentを変更しない。
+
+```bash
+./scripts/il_cs_ras_debug_build.sh
+# TAGに公式RAS Reflectorが既に書き込まれていることを確認する。
+# LOCATORだけ診断版をflashする。シリアル番号は実機ラベルと照合する。
+west flash --skip-rebuild -d build/il_cs_ras_debug_initiator --dev-id <LOCATOR_SERIAL>
+./scripts/il_cs_log_capture.sh initiator /dev/serial/by-id/<LOCATOR_VCOM1> 120 --normal
+python3 scripts/il_cs_ras_debug_analyze.py logs/il_cs/<CAPTURE>.log \
+  --output-dir analysis_out/il_cs_ras_debug/one_meter_v1 --true-distance-m 1.0
+```
+
+診断版は最大2秒に1回、`cs_de`が使用したlocal/peer IQ、両側tone品質、RTT累積値と件数、公式の未平滑化3方式の推定値を`ILRAS1`形式で出力する。取得したIQは高品質toneの平均値であり、個々のRF測定値ではない。専用の低優先度キューからUARTへ出すため、測定コールバックで全行の出力待ちはしない。UARTは115200 baud、既存ログ取得スクリプトの`--normal`を使う。フレーム末尾には75 tone件数とFNV-1aチェックサムを付け、欠落・途中切断したprocedureは解析対象から除く。取りこぼした抽出スロット数もフレームヘッダへ記録する。
+
+解析器は同一フレームから次を計算し、`procedures.csv`、`tones.csv`、`ifft_peaks.csv`、`summary.json`を出力する。
+PC側解析にはPython 3とNumPyが必要である。
+
+- NCS v3.2.3 `cs_de.c`のIFFTピーク選択・位相傾き・RTTの再計算。まずファームの生の推定値との一致を確認する。
+- IFFTの上位ピーク、Nordic選択ピーク、ノイズ床と最大ピーク比で判定する最初の有効ピーク。
+- 高品質toneと合成振幅で重み付けし、外れ位相の影響を下げる位相傾き。
+
+候補パラメータは`--early-relative`、`--early-noise-sigma`、`--huber-k`で同じログに繰り返し適用できる。1 mの結果だけで採用せず、既存0.5 m / 1.0 m結果との整合と、後日の0.5 m / 2 m各1回で過学習を確認する。診断版のビルド、実機書き込み、UART記録、解析一致はそれぞれ別の検証項目とする。
+
+### 9.1 1 m初回実測結果
+
+2026-09-25にLOCATORへ診断版、TAGへ公式RAS Reflectorを書き込み、同じ高さ・同じ向き・見通しの1.0 m固定配置でUARTを取得した。公式INFOログが`ILRAS1`のtone行へ割り込むことを初回取得で確認したため、診断buildだけ`CONFIG_LOG_OVERRIDE_LEVEL=1`としてINFO表示を抑制した。公式RAS buildとTAGは変更していない。
+
+- ログ: `logs/il_cs/locator_uart_clean_1m.log`
+- 解析先: `analysis_out/il_cs_ras_debug/uart_clean_1m/`
+- 完全フレーム: 20件
+- 完全フレーム内の`missed_capture_slots`: 全件0
+- 解析器が報告した24件のframing error: 取得開始時点ですでに送信中だったsample 446の先頭欠落行。以後の完全フレームとは分離して除外した。
+- good tone数: 中央値70、範囲61～72
+
+| 方式 | 中央値 (m) | 範囲 (m) | 真値1.0 mとの差 |
+|---|---:|---:|---:|
+| ファームIFFT | 3.220 | 2.635～3.513 | +2.220 m |
+| Nordic相当IFFT再計算 | 3.220 | 2.635～3.513 | +2.220 m |
+| 早期IFFTピーク候補 | 4.466 | 4.215～4.871 | +3.466 m |
+| ファーム位相傾き | 4.699 | 4.345～5.936 | +3.699 m |
+| ロバスト位相傾き候補 | 4.514 | 4.243～5.064 | +3.514 m |
+| ファームRTT | 9.941 | 8.229～15.523 | +8.941 m |
+
+ファームIFFTとオフライン再計算の差は各フレームで1 mm未満であり、IQ抽出、固定小数点変換、tone品質除外、Nordic相当IFFT再現は成立した。一方、最初の有効ピーク候補はbin 15～17付近の強いピークを選び、公式IFFTが選ぶbin 9～12よりさらに遠距離となった。ロバスト位相傾きも誤差を小さくできなかった。したがって、早期ピーク候補とロバスト位相候補は現設定のまま採用しない。
+
+今回のIFFT形状だけでは真値1 m付近に安定した独立ピークを確認できず、「公式推定が単純に後方の反射ピークだけを選んでいる」とは断定できない。既取得の開放空間0.5～3.0 m rawでも距離順位が成立していないため、1 mだけのoffset補正や、この1ログへ合わせた閾値調整は行わない。次は保存IQ上でピーク全体と品質指標を比較し、採用可能な候補が得られた場合だけ0.5 m / 2 mを各1回追加取得する。
