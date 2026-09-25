@@ -20,6 +20,7 @@ from il_cs_ras_debug_analyze import (  # noqa: E402
     parse_frames,
     robust_phase_slope,
 )
+from il_cs_ras_debug_profile import frame_profile, local_maxima  # noqa: E402
 
 
 def synthetic_frame(distance_m: float = 1.0) -> dict:
@@ -77,6 +78,13 @@ class RasDebugAnalyzeTests(unittest.TestCase):
         robust, count = robust_phase_slope(z, good)
         self.assertEqual(count, 74)
         self.assertAlmostEqual(robust, 1.0, delta=0.05)
+
+    def test_full_profile_preserves_synthetic_distance_peak(self) -> None:
+        profile, selected = frame_profile(synthetic_frame())
+        strongest = int(np.argmax(profile[:50]))
+        self.assertAlmostEqual(strongest * C_M_PER_S / (2 * 512 * 1_000_000), 1.0, delta=0.3)
+        self.assertIn(strongest, local_maxima(profile[:50]))
+        self.assertAlmostEqual(selected * C_M_PER_S / (2 * 512 * 1_000_000), 1.0, delta=0.4)
 
 
 if __name__ == "__main__":

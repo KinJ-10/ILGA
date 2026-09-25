@@ -63,6 +63,7 @@
 - parserがchecksummed ILCS2の前へ結合した非raw文字列を見逃していたため、`NON_RAW_PREFIX_BEFORE_RECORD`として記録しつつrecord自体は保持するよう修正する。成果は`docs/il/results/20260916_uart_pacing/`へ保存する。
 - 次の距離推定比較として、NCS v3.2.3公式Nordic RAS + `cs_de`のInitiator / Reflectorを現行ILと独立したbuildディレクトリで構築した。2026-09-17にLOCATOR / TAGの両DKへ書き込み、45秒の実機smokeで449件のIFFT・位相傾き・RTTを連続取得し、fatal error・再起動なしを確認した。動作確認は合格。設置距離を記録していないため絶対距離精度は未評価で、次は0.5 m・120秒の真値付き試験を行う。
 - 2026-09-25: 診断版のNCS build、LOCATORへのflash、TAGとのBLE / CS接続、1 m UART実測まで完了。20完全フレームで抽出スロット欠落0、ファームIFFTとオフライン再計算は1 mm未満で一致した。1 m中央値は公式IFFT 3.220 m、早期IFFT候補4.466 m、公式位相4.699 m、ロバスト位相候補4.514 m、RTT 9.941 mで、追加候補は改善しなかった。単純offset補正と現候補の実機採用は見送り、保存IQで候補探索を継続する。
+- 同ログの全IFFTプロファイル解析では、真値1 m周辺に局所ピークは0/20件、主ローブは約4.4 m、フレーム間形状相関0.964だった。支配IFFTとロバスト位相は相関0.905、中央値差-0.034 mで同じ約4.5 mの実効遅延を示す。閾値20通りの掃引でも改善せず、次は約3.5 mの校正仮説を0.5 m / 2.0 m各1回で検証する。
 - 実機試験手順と合否基準は`docs/il/IL_PHASE0_CHANNEL_SOUNDING.md`を参照する。
 
 ## 開発環境
